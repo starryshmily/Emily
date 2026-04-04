@@ -2,8 +2,8 @@
  * C3 UART通信模块 - 与K230通信
  *
  * 硬件连接:
- *   C3 GPIO18(TX) <-> K230 GPIO12(RXD)
- *   C3 GPIO19(RX) <-> K230 GPIO11(TXD)
+ *   C3 GPIO18(TX) <-> K230 GPIO04(UART1_RXD)
+ *   C3 GPIO19(RX) <-> K230 GPIO03(UART1_TXD)
  *   GND <-> GND
  */
 
@@ -21,10 +21,16 @@
 #define C3_UART_BAUD    115200
 #define C3_UART_BUF_SIZE 256
 
-// K230命令定义
+// K230命令定义 - 现有
 #define CMD_XIAOZHI     "XIAOZHI"
 #define CMD_BEEP_SHORT  "BEEP:SHORT"
 #define CMD_BEEP_LONG   "BEEP:LONG"
+
+// K230命令定义 - 状态机新增
+#define CMD_START_DETECT  "START_DETECT"
+#define CMD_STOP          "STOP"
+#define CMD_UP            "UP"
+#define CMD_DOWN          "DOWN"
 
 /**
  * 初始化UART1 (与K230通信)

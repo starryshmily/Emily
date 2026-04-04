@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
@@ -611,21 +612,44 @@ esp_err_t k230_client_start_stream(void)
         return ESP_OK;
     }
 
+    // 等待之前的任务完全清理 (防止内存碎片)
+    vTaskDelay(pdMS_TO_TICKS(100));
+
     g_stream_running = true;
 
-    // 创建MJPEG流接收任务
-    // tjpgd解码器需要较大栈空间（递归+局部变量），增加到16KB
-    BaseType_t ret = xTaskCreate(
-        mjpeg_stream_task,
-        "mjpeg_stream",
-        16384,  // 堆栈大小（tjpgd需要大量栈）
-        NULL,
-        5,     // 优先级
-        &g_stream_task_handle
-    );
+    // 打印内存状态
+    ESP_LOGI(TAG, "Free heap before stream task: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
+    // 创建MJPEG流接收任务 (带重试机制)
+    // tjpgd解码器配置了JD_FASTDECODE=1, 栈需求较低
+    BaseType_t ret = pdFAIL;
+    uint16_t stack_sizes[] = {8192, 6144, 10240};  // 尝试8KB, 6KB, 10KB
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        ret = xTaskCreate(
+            mjpeg_stream_task,
+            "mjpeg_stream",
+            stack_sizes[attempt],
+            NULL,
+            5,     // 优先级
+            &g_stream_task_handle
+        );
+
+        if (ret == pdPASS) {
+            ESP_LOGI(TAG, "Stream task created with stack=%d (attempt %d)", stack_sizes[attempt], attempt + 1);
+            break;
+        }
+
+        ESP_LOGW(TAG, "Task create failed with stack=%d (attempt %d, heap=%lu)",
+                 stack_sizes[attempt], attempt + 1, (unsigned long)esp_get_free_heap_size());
+
+        // 等待内存释放后再试
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
 
     if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create stream task");
+        ESP_LOGE(TAG, "Failed to create stream task after 3 attempts (free heap: %lu bytes)",
+                 (unsigned long)esp_get_free_heap_size());
         g_stream_running = false;
         return ESP_FAIL;
     }
@@ -636,18 +660,19 @@ esp_err_t k230_client_start_stream(void)
 
 void k230_client_stop_stream(void)
 {
-    if (g_stream_running) {
-        g_stream_running = false;
+    g_stream_running = false;
 
-        // 等待流任务结束
-        if (g_stream_task_handle) {
-            int wait_count = 0;
-            while (g_stream_task_handle != NULL && wait_count < 50) {
-                vTaskDelay(pdMS_TO_TICKS(100));
-                wait_count++;
-            }
+    // 等待流任务结束 (无论之前状态如何)
+    if (g_stream_task_handle) {
+        int wait_count = 0;
+        while (g_stream_task_handle != NULL && wait_count < 50) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            wait_count++;
         }
-
-        ESP_LOGI(TAG, "Video stream stopped");
+        if (g_stream_task_handle != NULL) {
+            ESP_LOGW(TAG, "Stream task did not exit in time");
+        }
     }
+
+    ESP_LOGI(TAG, "Video stream stopped");
 }

@@ -105,6 +105,11 @@ esp_err_t k230_client_start_stream(void);
  */
 void k230_client_stop_stream(void);
 
+/**
+ * @brief 强制停止MJPEG视频流 (关闭socket, 等待最多2秒)
+ */
+void k230_client_force_stop_stream(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -64,6 +64,11 @@ camera_state_t ui_camera_get_state(void);
  */
 void ui_camera_handle_k230_status(const char *status_str);
 
+/**
+ * @brief 心跳信号 - 收到任何K230数据时调用，更新超时计时器
+ */
+void ui_camera_heartbeat(void);
+
 #ifdef __cplusplus
 }
 #endif

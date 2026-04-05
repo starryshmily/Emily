@@ -50,8 +50,9 @@ static const char *TAG = "ui_camera";
 #define SLIDER_DOWN_LIMIT_MM  10.0f   // 距底<10mm时DOWN不可点
 #define SLIDER_MOVE_MM       10.0f    // 每次移动10mm
 
-// K230断开检测 - 视频流超时
-#define STREAM_TIMEOUT_MS  5000
+// K230断开检测 - 视频流超时 (增加到20秒以适应慢速网络如手机热点)
+// 注意: 手机热点可能非常慢，帧间隔可能超过10秒
+#define STREAM_TIMEOUT_MS  20000
 
 // UI components
 static lv_obj_t *screen_camera = NULL;
@@ -475,24 +476,27 @@ static void progress_callback(int progress, const char *message, const char *sta
 static void btn_back_callback(lv_event_t *e)
 {
     if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
-        uart_rx_running = false;
-        if (uart_rx_task_handle) {
-            int wait = 0;
-            while (uart_rx_task_handle != NULL && wait < 30) {
-                vTaskDelay(pdMS_TO_TICKS(100));
-                wait++;
-            }
-        }
+        // 立即标记断开 (防止断开处理函数触发)
+        k230_connected = false;
 
+        // 停止UART接收 (非阻塞, 只是设置标志)
+        uart_rx_running = false;
+
+        // 停止定时器
         if (detect_timer) {
             esp_timer_stop(detect_timer);
         }
+        if (force_stop_timer) {
+            esp_timer_stop(force_stop_timer);
+        }
 
-        // 停止视频流和连接 (原有逻辑，不修改)
-        k230_client_stop_stream();
-        k230_client_disconnect();
-        k230_connected = false;
+        // 清空frame callback, 防止stream任务访问已删除的资源
+        k230_client_set_frame_callback(NULL);
 
+        // 强制断开K230连接 (关闭socket让recv立即返回)
+        k230_client_force_stop_stream();
+
+        // 清理资源 (不等待任务完成, 任务会自行退出)
         if (video_mutex) {
             vSemaphoreDelete(video_mutex);
             video_mutex = NULL;
@@ -503,6 +507,12 @@ static void btn_back_callback(lv_event_t *e)
             detect_timer = NULL;
         }
 
+        if (force_stop_timer) {
+            esp_timer_delete(force_stop_timer);
+            force_stop_timer = NULL;
+        }
+
+        // 重置状态并立即切换页面
         current_state = STATE_CONNECTING;
         lv_scr_load(ui_home_get_screen());
     }
@@ -744,4 +754,11 @@ void ui_camera_handle_k230_status(const char *status_str)
     } else if (strcmp(status_str, "STOP:OK") == 0) {
         switch_state(STATE_IDLE);
     }
+}
+
+void ui_camera_heartbeat(void)
+{
+    // 更新最后活动时间，防止超时误判
+    // 在收到任何K230数据时调用
+    last_frame_time_ms = esp_timer_get_time() / 1000;
 }

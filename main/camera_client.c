@@ -5,6 +5,7 @@
 
 #include "camera_client.h"
 #include "jpeg_decoder.h"
+#include "ui_camera.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_timer.h"
@@ -45,6 +46,7 @@ static bool g_is_connected = false;
 static bool g_stream_running = false;
 
 static TaskHandle_t g_stream_task_handle = NULL;
+static int g_stream_socket = -1;  // 用于强制关闭socket
 
 // MJPEG流配置 - video buffer占153.6KB后剩余内存有限
 // 流缓冲区仅用于接收数据，大帧会被丢弃跳过
@@ -205,9 +207,13 @@ static void mjpeg_stream_task(void *arg)
         return;
     }
 
-    // 设置接收超时5秒，发送超时5秒
-    struct timeval recv_timeout = { .tv_sec = 5, .tv_usec = 0 };
-    struct timeval send_timeout = { .tv_sec = 5, .tv_usec = 0 };
+
+    g_stream_socket = sock;  // 保存socket fd用于强制关闭
+
+    // 设置接收超时20秒，发送超时10秒 (适应慢速网络如手机热点)
+    // 注意: 手机热点可能非常慢，完整帧可能需要15秒以上才能到达
+    struct timeval recv_timeout = { .tv_sec = 20, .tv_usec = 0 };
+    struct timeval send_timeout = { .tv_sec = 10, .tv_usec = 0 };
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
 
@@ -222,6 +228,7 @@ static void mjpeg_stream_task(void *arg)
     if (inet_pton(AF_INET, g_config.host, &dest_addr.sin_addr) != 1) {
         ESP_LOGE(TAG, "Invalid IP address: %s", g_config.host);
         close(sock);
+        g_stream_socket = -1;
         g_stream_running = false;
         vTaskDelete(NULL);
         return;
@@ -233,6 +240,7 @@ static void mjpeg_stream_task(void *arg)
     if (ret != 0) {
         ESP_LOGE(TAG, "Failed to connect: errno=%d", errno);
         close(sock);
+        g_stream_socket = -1;
         g_stream_running = false;
         vTaskDelete(NULL);
         return;
@@ -284,7 +292,7 @@ static void mjpeg_stream_task(void *arg)
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 recv_timeout_count++;
                 if (recv_timeout_count <= 3) {
-                    ESP_LOGW(TAG, "Recv timeout #%d (no data for 2s)", recv_timeout_count);
+                    ESP_LOGW(TAG, "Recv timeout #%d (no data for 20s)", recv_timeout_count);
                 }
                 continue;  // 超时，继续等待
             }
@@ -296,6 +304,9 @@ static void mjpeg_stream_task(void *arg)
         if (recv_count <= 3) {
             ESP_LOGI(TAG, "Recv #%d: got %d bytes (total buffer: %d)", recv_count, read_len, buffer_pos + read_len);
         }
+
+        // 收到数据 → 通知UI层连接仍然存活
+        ui_camera_heartbeat();
 
         if (read_len == 0) {
             ESP_LOGW(TAG, "Connection closed by server after %d recv calls", recv_count);
@@ -515,7 +526,10 @@ static void mjpeg_stream_task(void *arg)
     }
 
     // 清理
-    close(sock);
+    if (g_stream_socket >= 0) {
+        close(g_stream_socket);
+        g_stream_socket = -1;
+    }
     jpeg_decoder_deinit();
 
     ESP_LOGI(TAG, "MJPEG stream task ended (received %d frames total)", frame_count);
@@ -616,6 +630,7 @@ esp_err_t k230_client_start_stream(void)
     vTaskDelay(pdMS_TO_TICKS(100));
 
     g_stream_running = true;
+    g_stream_socket = -1;  // 重置socket fd
 
     // 打印内存状态
     ESP_LOGI(TAG, "Free heap before stream task: %lu bytes", (unsigned long)esp_get_free_heap_size());
@@ -658,21 +673,27 @@ esp_err_t k230_client_start_stream(void)
     return ESP_OK;
 }
 
+void k230_client_force_stop_stream(void)
+{
+    g_stream_running = false;
+    g_is_connected = false;
+
+    // 强制关闭socket让recv立即返回错误
+    if (g_stream_socket >= 0) {
+        ESP_LOGI(TAG, "Force closing stream socket");
+        close(g_stream_socket);
+        g_stream_socket = -1;
+    }
+
+    // 不等待任务退出，让它自行清理
+    // recv()会因为socket关闭而返回错误，任务会自动退出
+    ESP_LOGI(TAG, "Video stream stop requested (non-blocking)");
+}
+
 void k230_client_stop_stream(void)
 {
     g_stream_running = false;
-
-    // 等待流任务结束 (无论之前状态如何)
-    if (g_stream_task_handle) {
-        int wait_count = 0;
-        while (g_stream_task_handle != NULL && wait_count < 50) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            wait_count++;
-        }
-        if (g_stream_task_handle != NULL) {
-            ESP_LOGW(TAG, "Stream task did not exit in time");
-        }
-    }
-
-    ESP_LOGI(TAG, "Video stream stopped");
+    g_is_connected = false;  // 让 recv() 立即返回
 }
+
+

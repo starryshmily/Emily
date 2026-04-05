@@ -1,7 +1,7 @@
 {
     "version":            "1",
     "project_name":       "lvgl_demo",
-    "project_version":    "fea2b1c-dirty",
+    "project_version":    "c6ab7ac-dirty",
     "project_path":       "D:/Emily/lvgl_demo",
     "idf_path":           "D:/Espressif/frameworks/esp-idf-v5.1.2",
     "build_dir":          "D:/Emily/lvgl_demo/build",
@@ -865,7 +865,7 @@
             "managed_reqs": [],
             "managed_priv_reqs": [ "espressif__esp_lcd_ili9341", "espressif__esp_lcd_touch_ft5x06", "lvgl__lvgl" ],
             "file": "D:/Emily/lvgl_demo/build/esp-idf/main/libmain.a",
-            "sources": [ "D:/Emily/lvgl_demo/main/c3_uart.c", "D:/Emily/lvgl_demo/main/camera_client.c", "D:/Emily/lvgl_demo/main/custom/custom.c", "D:/Emily/lvgl_demo/main/custom/gxhtc3.c", "D:/Emily/lvgl_demo/main/custom/myi2c.c", "D:/Emily/lvgl_demo/main/generated/events_init.c", "D:/Emily/lvgl_demo/main/generated/gui_guider.c", "D:/Emily/lvgl_demo/main/generated/guider_fonts/lv_font_montserratMedium_16.c", "D:/Emily/lvgl_demo/main/generated/images/_320_alpha_240x320.c", "D:/Emily/lvgl_demo/main/generated/images/_444_alpha_240x320.c", "D:/Emily/lvgl_demo/main/generated/images/_test2_alpha_240x320.c", "D:/Emily/lvgl_demo/main/generated/setup_scr_screen.c", "D:/Emily/lvgl_demo/main/generated/widgets_init.c", "D:/Emily/lvgl_demo/main/jpeg_decoder.c", "D:/Emily/lvgl_demo/main/lvgl_demo_ui.c", "D:/Emily/lvgl_demo/main/myi2c.c", "D:/Emily/lvgl_demo/main/spi_lcd_touch_example_main.c", "D:/Emily/lvgl_demo/main/ui/fonts/SIMYOU.c", "D:/Emily/lvgl_demo/main/ui/ui_about.c", "D:/Emily/lvgl_demo/main/ui/ui_brightness.c", "D:/Emily/lvgl_demo/main/ui/ui_camera.c", "D:/Emily/lvgl_demo/main/ui/ui_home.c", "D:/Emily/lvgl_demo/main/ui/ui_settings.c", "D:/Emily/lvgl_demo/main/ui/ui_temp.c", "D:/Emily/lvgl_demo/main/ui/ui_wifi.c", "D:/Emily/lvgl_demo/main/wifi_scanner.c" ],
+            "sources": [ "D:/Emily/lvgl_demo/main/c3_uart.c", "D:/Emily/lvgl_demo/main/camera_client.c", "D:/Emily/lvgl_demo/main/custom/custom.c", "D:/Emily/lvgl_demo/main/custom/gxhtc3.c", "D:/Emily/lvgl_demo/main/custom/myi2c.c", "D:/Emily/lvgl_demo/main/generated/events_init.c", "D:/Emily/lvgl_demo/main/generated/gui_guider.c", "D:/Emily/lvgl_demo/main/generated/guider_fonts/lv_font_montserratMedium_16.c", "D:/Emily/lvgl_demo/main/generated/images/_320_alpha_240x320.c", "D:/Emily/lvgl_demo/main/generated/images/_444_alpha_240x320.c", "D:/Emily/lvgl_demo/main/generated/images/_test2_alpha_240x320.c", "D:/Emily/lvgl_demo/main/generated/setup_scr_screen.c", "D:/Emily/lvgl_demo/main/generated/widgets_init.c", "D:/Emily/lvgl_demo/main/jpeg_decoder.c", "D:/Emily/lvgl_demo/main/lvgl_demo_ui.c", "D:/Emily/lvgl_demo/main/spi_lcd_touch_example_main.c", "D:/Emily/lvgl_demo/main/ui/fonts/SIMYOU.c", "D:/Emily/lvgl_demo/main/ui/ui_about.c", "D:/Emily/lvgl_demo/main/ui/ui_brightness.c", "D:/Emily/lvgl_demo/main/ui/ui_camera.c", "D:/Emily/lvgl_demo/main/ui/ui_home.c", "D:/Emily/lvgl_demo/main/ui/ui_settings.c", "D:/Emily/lvgl_demo/main/ui/ui_temp.c", "D:/Emily/lvgl_demo/main/ui/ui_wifi.c", "D:/Emily/lvgl_demo/main/wifi_scanner.c" ],
             "include_dirs": [ ".", "ui", "ui/fonts", "custom", "generated", "generated/guider_customer_fonts", "generated/guider_fonts", "generated/images" ]
         },
         "mbedtls": {

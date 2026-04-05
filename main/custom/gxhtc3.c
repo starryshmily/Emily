@@ -136,29 +136,54 @@ uint8_t temp_int, humi_int;
 // 获取并计算温湿度数据
 esp_err_t gxhtc3_get_tah(void)
 {
-    int ret;
+    esp_err_t ret;
 
-    gxhtc3_wake_up();
-    gxhtc3_measure();
+    // 检查每个I2C操作的返回值
+    ret = gxhtc3_wake_up();
+    if (ret != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    ret = gxhtc3_measure();
+    if (ret != ESP_OK) {
+        gxhtc3_sleep();  // 即使失败也尝试休眠
+        return ESP_FAIL;
+    }
+
     vTaskDelay(20 / portTICK_PERIOD_MS);
-    gxhtc3_read_tah();
+
+    ret = gxhtc3_read_tah();
+    if (ret != ESP_OK) {
+        gxhtc3_sleep();
+        return ESP_FAIL;
+    }
+
     gxhtc3_sleep();
 
-    if((tah_data[2]!=gxhtc3_calc_crc(tah_data,2)||(tah_data[5]!=gxhtc3_calc_crc(&tah_data[3],2)))){     
+    // CRC校验
+    if((tah_data[2] != gxhtc3_calc_crc(tah_data, 2)) || (tah_data[5] != gxhtc3_calc_crc(&tah_data[3], 2))) {
         temp = 0;
         humi = 0;
         temp_int = 0;
         humi_int = 0;
-        ret = ESP_FAIL;
+        return ESP_FAIL;
     }
-    else{
-        rawValueTemp = (tah_data[0]<<8) | tah_data[1];
-        rawValueHumi = (tah_data[3]<<8) | tah_data[4];
-        temp = (175.0 * (float)rawValueTemp) / 65535.0 - 45.0; 
-        humi = (100.0 * (float)rawValueHumi) / 65535.0;
-        temp_int = round(temp);
-        humi_int = round(humi);
-        ret = ESP_OK;
+
+    rawValueTemp = (tah_data[0]<<8) | tah_data[1];
+    rawValueHumi = (tah_data[3]<<8) | tah_data[4];
+    temp = (175.0 * (float)rawValueTemp) / 65535.0 - 45.0;
+    humi = (100.0 * (float)rawValueHumi) / 65535.0;
+
+    // 数值合理性检查：温度范围 -40~125°C，湿度范围 0~100%
+    if (temp < -40.0f || temp > 125.0f || humi < 0.0f || humi > 100.0f) {
+        temp = 0;
+        humi = 0;
+        temp_int = 0;
+        humi_int = 0;
+        return ESP_FAIL;
     }
-    return ret;
+
+    temp_int = round(temp);
+    humi_int = round(humi);
+    return ESP_OK;
 }

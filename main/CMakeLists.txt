@@ -1,6 +1,5 @@
 file(GLOB_RECURSE srcs *.c
                     spi_lcd_touch_example_main.c
-                    myi2c.c
                     wifi_scanner.c
                     camera_client.c
                     jpeg_decoder.c

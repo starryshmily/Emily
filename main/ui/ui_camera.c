@@ -54,19 +54,28 @@ static const char *TAG = "ui_camera";
 // 注意: 手机热点可能非常慢，帧间隔可能超过10秒
 #define STREAM_TIMEOUT_MS  20000
 
+// 待执行的移动方向 (用于MOVE:OK后更新高度)
+static volatile int pending_move_direction = 0;  // 0=无, 1=UP, -1=DOWN
+
 // UI components
 static lv_obj_t *screen_camera = NULL;
 static lv_obj_t *label_status = NULL;
+static lv_obj_t *label_height = NULL;  // 高度显示标签
 static lv_obj_t *btn_back = NULL;
 static lv_obj_t *btn_start = NULL;
 static lv_obj_t *label_start = NULL;
 static lv_obj_t *btn_cancel = NULL;
 static lv_obj_t *btn_up = NULL;
 static lv_obj_t *btn_down = NULL;
+static lv_obj_t *btn_calibrate = NULL;  // 校准按钮
+static lv_obj_t *label_calibrate = NULL; // 校准按钮文字
 
 // Video buffer - 静态分配
 static uint8_t video_buffer[VIDEO_W * VIDEO_H * 2];
 static SemaphoreHandle_t video_mutex = NULL;
+
+// LCD绘制互斥锁 - 防止视频帧绘制和UI更新同时进行导致SPI冲突
+static SemaphoreHandle_t lcd_draw_mutex = NULL;
 
 // 首帧标志 - 必须是全局static，在create时重置
 static bool first_frame_received = false;
@@ -89,6 +98,7 @@ static esp_timer_handle_t force_stop_timer = NULL;
 // 滑块状态追踪
 static volatile float slider_height_mm = 0.0f;  // 当前高度mm
 static volatile bool slider_moving = false;        // 电机是否在移动中
+static float height_before_calib = 0.0f;  // 校准前的高度（用于校准模式取消）
 
 // K230断开检测
 static volatile int64_t last_frame_time_ms = 0; // 最后一帧时间戳
@@ -104,7 +114,7 @@ static void handle_k230_disconnect(const char *reason);
 static void set_btn_style(lv_obj_t *btn, uint32_t color, bool clickable)
 {
     lv_obj_set_style_bg_color(btn, lv_color_hex(color), 0);
-    lv_obj_clear_state(btn, LV_STATE_PRESSED);
+    lv_obj_clear_state(btn, LV_STATE_PRESSED | LV_STATE_CHECKED | LV_STATE_FOCUSED);
     if (clickable) {
         lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
     } else {
@@ -116,20 +126,51 @@ static void set_btn_style(lv_obj_t *btn, uint32_t color, bool clickable)
 static void set_btn_disabled(lv_obj_t *btn, uint32_t color)
 {
     lv_obj_set_style_bg_color(btn, lv_color_hex(color), 0);
-    lv_obj_clear_state(btn, LV_STATE_PRESSED);
+    lv_obj_clear_state(btn, LV_STATE_PRESSED | LV_STATE_CHECKED | LV_STATE_FOCUSED);
     lv_obj_clear_flag(btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_style_opa(btn, LV_OPA_50, 0);
+}
+
+// ============== 更新高度显示 ==============
+static void update_height_label(void)
+{
+    if (!label_height) return;
+    // 校准模式下隐藏高度
+    if (current_state == STATE_CALIBRATING) {
+        lv_obj_add_flag(label_height, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_clear_flag(label_height, LV_OBJ_FLAG_HIDDEN);
+    float cm = slider_height_mm / 10.0f;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.1f\n(cm)", cm);
+    lv_label_set_text(label_height, buf);
+    // 连接成功绿色，未连接灰色
+    lv_color_t c = k230_connected ? lv_color_hex(0x00FF00) : lv_color_hex(0xAAAAAA);
+    lv_obj_set_style_text_color(label_height, c, 0);
 }
 
 // ============== 更新UP/DOWN按钮状态 (根据高度) ==============
 
 static void update_up_down_buttons(void)
 {
+    // 获取LCD锁，防止与视频帧绘制的SPI操作冲突
+    bool locked = (lcd_draw_mutex && xSemaphoreTakeRecursive(lcd_draw_mutex, pdMS_TO_TICKS(100)) == pdTRUE);
+
+    update_height_label();
+
     // 电机移动中 → 都灰色不可点
     if (slider_moving) {
         set_btn_disabled(btn_up, COLOR_GRAY);
         set_btn_disabled(btn_down, COLOR_GRAY);
-        return;
+        goto unlock;
+    }
+
+    // 校准模式: UP/DOWN无行程限制，始终绿色
+    if (current_state == STATE_CALIBRATING) {
+        set_btn_style(btn_up, COLOR_GREEN_UP, true);
+        set_btn_style(btn_down, COLOR_GREEN_UP, true);
+        goto unlock;
     }
 
     // UP按钮: 距顶部<10mm时灰色
@@ -139,12 +180,15 @@ static void update_up_down_buttons(void)
         set_btn_style(btn_up, COLOR_GREEN_UP, true);
     }
 
-    // DOWN按钮: 距底部<10mm时灰色
-    if (slider_height_mm <= SLIDER_DOWN_LIMIT_MM) {
+    // DOWN按钮: 在最底部(0mm)时灰色
+    if (slider_height_mm <= 0.0f) {
         set_btn_disabled(btn_down, COLOR_GRAY);
     } else {
         set_btn_style(btn_down, COLOR_GREEN_UP, true);
     }
+
+unlock:
+    if (locked) xSemaphoreGiveRecursive(lcd_draw_mutex);
 }
 
 // ============== K230断开处理 ==============
@@ -155,6 +199,7 @@ static void handle_k230_disconnect(const char *reason)
     k230_connected = false;
     slider_height_mm = 0;
     slider_moving = false;
+    pending_move_direction = 0;
     switch_state(STATE_CONN_FAILED);
 }
 
@@ -167,6 +212,9 @@ static void switch_state(camera_state_t new_state)
 
     ESP_LOGI(TAG, "State: %d -> %d", old_state, new_state);
 
+    // 获取LCD锁保护所有LVGL操作
+    bool locked = (lcd_draw_mutex && xSemaphoreTakeRecursive(lcd_draw_mutex, pdMS_TO_TICKS(100)) == pdTRUE);
+
     switch (new_state) {
     case STATE_CONNECTING:
         label_status ? lv_label_set_text(label_status, "Conn...") : (void)0;
@@ -174,6 +222,8 @@ static void switch_state(camera_state_t new_state)
         set_btn_disabled(btn_up, COLOR_GRAY);
         set_btn_disabled(btn_down, COLOR_GRAY);
         set_btn_disabled(btn_cancel, COLOR_GRAY);
+        // 校准按钮隐藏
+        if (btn_calibrate) lv_obj_add_flag(btn_calibrate, LV_OBJ_FLAG_HIDDEN);
         break;
 
     case STATE_CONN_FAILED:
@@ -182,6 +232,8 @@ static void switch_state(camera_state_t new_state)
         set_btn_disabled(btn_up, COLOR_GRAY);
         set_btn_disabled(btn_down, COLOR_GRAY);
         set_btn_disabled(btn_cancel, COLOR_GRAY);
+        // 校准按钮隐藏
+        if (btn_calibrate) lv_obj_add_flag(btn_calibrate, LV_OBJ_FLAG_HIDDEN);
         break;
 
     case STATE_IDLE:
@@ -190,8 +242,27 @@ static void switch_state(camera_state_t new_state)
         set_btn_style(btn_start, COLOR_GREEN, true);
         update_up_down_buttons();
         set_btn_disabled(btn_cancel, COLOR_GRAY);
+        // 校准按钮显示"CAL"
+        if (btn_calibrate) {
+            lv_obj_clear_flag(btn_calibrate, LV_OBJ_FLAG_HIDDEN);
+            if (label_calibrate) lv_label_set_text(label_calibrate, "CAL");
+            set_btn_style(btn_calibrate, COLOR_GREEN, true);
+        }
         // 重置超时计数器: 从YOLO状态返回时视频流可能还没恢复
         last_frame_time_ms = 0;
+        break;
+
+    case STATE_CALIBRATING:
+        label_status ? lv_label_set_text(label_status, "CAL") : (void)0;
+        set_btn_disabled(btn_start, COLOR_GRAY);  // SCAN灰色不可点
+        update_up_down_buttons();  // UP/DOWN无限制
+        set_btn_style(btn_cancel, COLOR_RED, true);  // Cancel仍可点
+        // 校准按钮显示"Yes"
+        if (btn_calibrate) {
+            lv_obj_clear_flag(btn_calibrate, LV_OBJ_FLAG_HIDDEN);
+            if (label_calibrate) lv_label_set_text(label_calibrate, "Yes");
+            set_btn_style(btn_calibrate, COLOR_GREEN, true);
+        }
         break;
 
     case STATE_DETECTING:
@@ -200,6 +271,7 @@ static void switch_state(camera_state_t new_state)
         set_btn_disabled(btn_up, COLOR_GRAY);
         set_btn_disabled(btn_down, COLOR_GRAY);
         set_btn_style(btn_cancel, COLOR_RED, true);
+        if (btn_calibrate) lv_obj_add_flag(btn_calibrate, LV_OBJ_FLAG_HIDDEN);
         if (detect_timer) {
             esp_timer_start_once(detect_timer, DETECT_TIMEOUT_MS * 1000);  // ms → us
         }
@@ -211,6 +283,7 @@ static void switch_state(camera_state_t new_state)
         set_btn_disabled(btn_up, COLOR_GRAY);
         set_btn_disabled(btn_down, COLOR_GRAY);
         set_btn_style(btn_cancel, COLOR_RED, true);
+        if (btn_calibrate) lv_obj_add_flag(btn_calibrate, LV_OBJ_FLAG_HIDDEN);
         if (detect_timer) {
             esp_timer_stop(detect_timer);
         }
@@ -222,6 +295,7 @@ static void switch_state(camera_state_t new_state)
         set_btn_style(btn_start, COLOR_GREEN, true);
         update_up_down_buttons();
         set_btn_style(btn_cancel, COLOR_RED, true);
+        if (btn_calibrate) lv_obj_add_flag(btn_calibrate, LV_OBJ_FLAG_HIDDEN);
         // 定位成功: 不自动返回IDLE, 等待用户手动CANCEL
         break;
 
@@ -231,6 +305,7 @@ static void switch_state(camera_state_t new_state)
         set_btn_disabled(btn_up, COLOR_GRAY);
         set_btn_disabled(btn_down, COLOR_GRAY);
         set_btn_disabled(btn_cancel, COLOR_GRAY);
+        if (btn_calibrate) lv_obj_add_flag(btn_calibrate, LV_OBJ_FLAG_HIDDEN);
         // 延迟2秒后返回IDLE
         if (detect_timer) {
             esp_timer_start_once(detect_timer, POS_FAIL_DELAY_MS * 1000);  // ms → us
@@ -243,9 +318,12 @@ static void switch_state(camera_state_t new_state)
         set_btn_style(btn_start, COLOR_GREEN, true);
         update_up_down_buttons();
         set_btn_style(btn_cancel, COLOR_RED, true);
+        if (btn_calibrate) lv_obj_add_flag(btn_calibrate, LV_OBJ_FLAG_HIDDEN);
         // 不自动返回IDLE, 等待用户手动CANCEL
         break;
     }
+
+    if (locked) xSemaphoreGiveRecursive(lcd_draw_mutex);
 }
 
 // ============== 强制停止回调 ==============
@@ -309,14 +387,39 @@ static void uart_rx_task(void *arg)
                 if (current_state == STATE_POSITIONING) {
                     switch_state(STATE_LIMIT_FAILED);
                 }
-            } else if (strcmp(clean, "MOVE:OK") == 0) {
-                // 电机移动完成
+            } else if (strncmp(clean, "MOVE:OK", 7) == 0) {
+                // 电机移动完成 - 使用K230返回的实际高度
                 slider_moving = false;
+                pending_move_direction = 0;
+                // 解析 MOVE:OK:xx.x 格式
+                const char *h_str = strchr(clean, ':');
+                if (h_str) {
+                    h_str++; // 跳过第一个冒号
+                    h_str = strchr(h_str, ':'); // 找第二个冒号
+                    if (h_str) {
+                        h_str++; // 跳过冒号
+                        slider_height_mm = atof(h_str);
+                    }
+                }
                 ESP_LOGI(TAG, "MOVE:OK, height=%.1fmm", slider_height_mm);
                 update_up_down_buttons();
+            } else if (strncmp(clean, "HEIGHT:", 7) == 0) {
+                // K230返回当前高度 (连接时查询)
+                const char *h_val = clean + 7;
+                slider_height_mm = atof(h_val);
+                ESP_LOGI(TAG, "HEIGHT from K230: %.1fmm", slider_height_mm);
+                update_up_down_buttons();
+            } else if (strcmp(clean, "ZERO:OK") == 0) {
+                // K230确认当前位置已归零
+                slider_height_mm = 0;
+                pending_move_direction = 0;
+                slider_moving = false;
+                ESP_LOGI(TAG, "ZERO:OK, height reset to 0");
+                switch_state(STATE_IDLE);  // 退出校准，回到IDLE
             } else if (strcmp(clean, "STOP:OK") == 0) {
                 // K230复位完成
                 slider_height_mm = 0;
+                pending_move_direction = 0;
                 if (force_stop_timer) {
                     esp_timer_stop(force_stop_timer);
                 }
@@ -387,9 +490,11 @@ static void k230_connect_task(void *arg)
 
     ESP_LOGI(TAG, "K230 connected");
     k230_connected = true;
-    slider_height_mm = 0.0f;
     slider_moving = false;
     last_frame_time_ms = 0; // 重置: 首帧到达后才开始超时检测
+
+    // 向K230查询当前高度
+    c3_uart_send("GET_HEIGHT");
 
     // 不立即切IDLE, 等首帧到达后在video_frame_callback中切换
 
@@ -441,11 +546,15 @@ static void video_frame_callback(const uint8_t *jpeg_data, size_t jpeg_len)
 
     esp_err_t err = jpeg_decode_to_rgb565(jpeg_data, jpeg_len, &cfg);
     if (err == ESP_OK) {
-        app_lcd_draw_bitmap(
-            VIDEO_POS_X, VIDEO_POS_Y,
-            VIDEO_POS_X + VIDEO_W, VIDEO_POS_Y + VIDEO_H,
-            video_buffer
-        );
+        // 获取LCD互斥锁，防止与UI更新的SPI操作冲突
+        if (xSemaphoreTakeRecursive(lcd_draw_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            app_lcd_draw_bitmap(
+                VIDEO_POS_X, VIDEO_POS_Y,
+                VIDEO_POS_X + VIDEO_W, VIDEO_POS_Y + VIDEO_H,
+                video_buffer
+            );
+            xSemaphoreGiveRecursive(lcd_draw_mutex);
+        }
         if (frame_count <= 3) {
             ESP_LOGI(TAG, "Frame #%d OK", frame_count);
         }
@@ -501,6 +610,10 @@ static void btn_back_callback(lv_event_t *e)
             vSemaphoreDelete(video_mutex);
             video_mutex = NULL;
         }
+        if (lcd_draw_mutex) {
+            vSemaphoreDelete(lcd_draw_mutex);
+            lcd_draw_mutex = NULL;
+        }
 
         if (detect_timer) {
             esp_timer_delete(detect_timer);
@@ -536,7 +649,14 @@ static void btn_cancel_callback(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
-    if (current_state == STATE_DETECTING || current_state == STATE_POSITIONING) {
+    if (current_state == STATE_CALIBRATING) {
+        // 校准模式: 取消校准，恢复校准前高度，返回IDLE（不保存修改）
+        ESP_LOGI(TAG, "Cancel calibration: restore height=%.1fmm", height_before_calib);
+        slider_height_mm = height_before_calib;
+        slider_moving = false;
+        pending_move_direction = 0;
+        switch_state(STATE_IDLE);
+    } else if (current_state == STATE_DETECTING || current_state == STATE_POSITIONING) {
         // K230还在YOLO模式，发送STOP让它退出并清理
         ESP_LOGI(TAG, "Cancel: sending STOP to K230 (YOLO mode)");
         c3_uart_send(CMD_STOP);
@@ -555,7 +675,16 @@ static void btn_cancel_callback(lv_event_t *e)
 static void btn_up_callback(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (slider_moving) return; // 电机移动中，忽略点击
+    if (slider_moving) return;
+
+    // 校准模式: 无行程限制
+    if (current_state == STATE_CALIBRATING) {
+        ESP_LOGI(TAG, "CAL UP (no limit)");
+        slider_moving = true;
+        update_up_down_buttons();
+        c3_uart_send(CMD_UP);
+        return;
+    }
 
     if (current_state == STATE_IDLE || current_state == STATE_POS_SUCCESS ||
         current_state == STATE_LIMIT_FAILED) {
@@ -573,14 +702,41 @@ static void btn_down_callback(lv_event_t *e)
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     if (slider_moving) return;
 
+    // 校准模式: 无行程限制
+    if (current_state == STATE_CALIBRATING) {
+        ESP_LOGI(TAG, "CAL DOWN (no limit)");
+        slider_moving = true;
+        update_up_down_buttons();
+        c3_uart_send(CMD_DOWN);
+        return;
+    }
+
     if (current_state == STATE_IDLE || current_state == STATE_POS_SUCCESS ||
         current_state == STATE_LIMIT_FAILED) {
-        if (slider_height_mm > SLIDER_DOWN_LIMIT_MM) {
+        if (slider_height_mm > 0.0f) {
             ESP_LOGI(TAG, "DOWN: sending DOWN to K230 (height=%.1fmm)", slider_height_mm);
             slider_moving = true;
+            pending_move_direction = -1;
             update_up_down_buttons();
             c3_uart_send(CMD_DOWN);
         }
+    }
+}
+
+// ============== 校准按钮回调 ==============
+static void btn_calibrate_callback(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+    if (current_state == STATE_CALIBRATING) {
+        // 点击"Yes" → 发送SET_ZERO，将当前位置归零
+        ESP_LOGI(TAG, "Calibrate confirm: SET_ZERO");
+        c3_uart_send("SET_ZERO");
+    } else if (current_state == STATE_IDLE) {
+        // 点击"CAL" → 进入校准模式，保存当前高度
+        ESP_LOGI(TAG, "Enter calibration mode");
+        height_before_calib = slider_height_mm;  // 保存校准前高度
+        switch_state(STATE_CALIBRATING);
     }
 }
 
@@ -598,6 +754,7 @@ void ui_camera_create(void)
     lv_obj_set_style_bg_opa(screen_camera, LV_OPA_COVER, 0);
 
     video_mutex = xSemaphoreCreateMutex();
+    lcd_draw_mutex = xSemaphoreCreateRecursiveMutex();  // 递归mutex允许同任务重复获取
 
     // 重置首帧标志 (重新进入页面时必须重新检测)
     first_frame_received = false;
@@ -633,6 +790,23 @@ void ui_camera_create(void)
     lv_obj_set_style_text_color(back_label, lv_color_white(), 0);
     lv_obj_center(back_label);
     lv_obj_add_event_cb(btn_back, btn_back_callback, LV_EVENT_ALL, NULL);
+
+    // ===== 校准按钮 - 右上角 =====
+    btn_calibrate = lv_btn_create(screen_camera);
+    lv_obj_set_size(btn_calibrate, 44, 35);
+    lv_obj_set_pos(btn_calibrate, 196, 2);  // 右上角，x=196（屏幕宽240-44=196）
+    lv_obj_set_style_bg_color(btn_calibrate, lv_color_hex(COLOR_GREEN), 0);
+    lv_obj_set_style_bg_opa(btn_calibrate, LV_OPA_90, 0);
+    lv_obj_set_style_radius(btn_calibrate, 6, 0);
+    lv_obj_set_style_border_width(btn_calibrate, 0, 0);
+    lv_obj_add_flag(btn_calibrate, LV_OBJ_FLAG_HIDDEN);  // 初始隐藏，连接成功后显示
+
+    label_calibrate = lv_label_create(btn_calibrate);
+    lv_label_set_text(label_calibrate, "CAL");
+    lv_obj_set_style_text_font(label_calibrate, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(label_calibrate, lv_color_white(), 0);
+    lv_obj_center(label_calibrate);
+    lv_obj_add_event_cb(btn_calibrate, btn_calibrate_callback, LV_EVENT_ALL, NULL);
 
     // ===== START按钮 - 底部居中 =====
     btn_start = lv_btn_create(screen_camera);
@@ -698,6 +872,20 @@ void ui_camera_create(void)
     lv_obj_center(down_label);
     lv_obj_add_event_cb(btn_down, btn_down_callback, LV_EVENT_ALL, NULL);
 
+    // ===== 高度显示 - 上下按钮中间位置，靠屏幕左边 =====
+    // UP按钮中心y=110, DOWN按钮中心y=210, 中间y=160
+    label_height = lv_label_create(screen_camera);
+    lv_label_set_text(label_height, "0.0\n(cm)");
+    lv_obj_set_style_text_font(label_height, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(label_height, lv_color_hex(0xAAAAAA), 0);  // 默认灰色
+    lv_obj_set_pos(label_height, 1, 148);  // 靠最左边，两行文字垂直居中调整
+    lv_obj_set_style_bg_opa(label_height, LV_OPA_50, 0);
+    lv_obj_set_style_bg_color(label_height, lv_color_black(), 0);
+    lv_obj_set_style_pad_left(label_height, 3, 0);
+    lv_obj_set_style_pad_right(label_height, 3, 0);
+    lv_obj_set_style_pad_top(label_height, 2, 0);
+    lv_obj_set_style_pad_bottom(label_height, 2, 0);
+
     // ===== 状态标签 - 右下角 =====
     label_status = lv_label_create(screen_camera);
     lv_label_set_text(label_status, "Conn...");
@@ -705,6 +893,7 @@ void ui_camera_create(void)
     lv_obj_set_pos(label_status, 185, 283);
 
     switch_state(STATE_CONNECTING);
+    update_height_label();
     lv_scr_load(screen_camera);
 
     // 异步连接K230 (不修改原有连接逻辑)

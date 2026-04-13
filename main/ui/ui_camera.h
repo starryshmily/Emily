@@ -19,6 +19,7 @@ typedef enum {
     STATE_CONNECTING,     // 连接K230中
     STATE_CONN_FAILED,    // 连接失败
     STATE_IDLE,           // 初始状态 (Ready)
+    STATE_CALIBRATING,    // 校准模式 (CAL) - 无行程限制
     STATE_DETECTING,      // YOLO检测物体中 (Found...)
     STATE_POSITIONING,    // 定位调节中 (Position...)
     STATE_POS_SUCCESS,    // 定位成功 (Pos Succ)

@@ -16,7 +16,8 @@
       "Bash(python draw_centering.py)",
       "Bash(ls \"D:\\\\Emily\\\\lvgl_demo\\\\draw_\"*)",
       "Bash(ls \"D:\\\\Emily\\\\draw_\"*)",
-      "Bash(python draw_statemachine.py)"
+      "Bash(python draw_statemachine.py)",
+      "WebSearch"
     ]
   }
 }

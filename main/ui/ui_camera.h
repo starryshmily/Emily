@@ -70,6 +70,18 @@ void ui_camera_handle_k230_status(const char *status_str);
  */
 void ui_camera_heartbeat(void);
 
+/**
+ * @brief 检查是否处于后台保活模式
+ * @return true if in background keepalive mode
+ */
+bool ui_camera_is_in_background(void);
+
+/**
+ * @brief 取消延迟断开 - 用户返回相机页面时调用
+ * 如果处于后台保活模式（点击返回后10秒内），恢复连接
+ */
+void ui_camera_cancel_delayed_disconnect(void);
+
 #ifdef __cplusplus
 }
 #endif

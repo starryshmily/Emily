@@ -496,7 +496,11 @@ static void mjpeg_stream_task(void *arg)
                 }
                 g_frame_callback(stream_buffer, frame_size);
             } else {
-                ESP_LOGW(TAG, "No frame_callback set!");
+                // frame_callback 为 NULL = 后台保活模式，视频流保持但不更新UI
+                // 仅每100帧打印一次，避免日志过多
+                if (frame_count % 100 == 0) {
+                    ESP_LOGI(TAG, "Background mode: frame #%d received (%d bytes)", frame_count, frame_size);
+                }
             }
 
             frame_count++;

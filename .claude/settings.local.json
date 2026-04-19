@@ -17,7 +17,8 @@
       "Bash(ls \"D:\\\\Emily\\\\lvgl_demo\\\\draw_\"*)",
       "Bash(ls \"D:\\\\Emily\\\\draw_\"*)",
       "Bash(python draw_statemachine.py)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(python3 -c ' *)"
     ]
   }
 }

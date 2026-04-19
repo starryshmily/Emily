@@ -10,7 +10,7 @@
 // 直接引用LVGL的tjpgd（需要启用LV_USE_SJPG）
 // 启用快速解码模式提升性能
 #define LV_USE_SJPG 1
-#define JD_FASTDECODE 1  // 0=标准, 1=快速, 2=最快(精度略降)
+#define JD_FASTDECODE 2  // 0=标准, 1=快速, 2=最快(精度略降)
 #include "../../managed_components/lvgl__lvgl/src/extra/libs/sjpg/tjpgd.h"
 
 static const char *TAG = "jpeg_dec";

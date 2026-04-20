@@ -52,9 +52,9 @@ static const char *TAG = "ui_camera";
 #define SLIDER_DOWN_LIMIT_MM  10.0f   // 距底<10mm时DOWN不可点
 #define SLIDER_MOVE_MM       10.0f    // 每次移动10mm
 
-// K230断开检测 - 视频流超时 (增加到20秒以适应慢速网络如手机热点)
-// 注意: 手机热点可能非常慢，帧间隔可能超过10秒
-#define STREAM_TIMEOUT_MS  20000  // 20秒视频流断连超时
+// K230断开检测 - 视频流超时 (25秒以覆盖HOME操作的最大时间20秒)
+// 注意: motor_busy时视频流暂停, HOME操作可能需要20秒, 超时需大于此值
+#define STREAM_TIMEOUT_MS  25000  // 25秒视频流断连超时
 
 // 待执行的移动方向 (用于MOVE:OK后更新高度)
 static volatile int pending_move_direction = 0;  // 0=无, 1=UP, -1=DOWN

@@ -98,3 +98,5 @@
 4042	4496	7983606475947185	D:/Emily/lvgl_demo/build/bootloader/.bin_timestamp	3fd8faed9d5346c4
 4497	4616	0	esp-idf/esptool_py/CMakeFiles/bootloader_check_size	a8b99f361b943e6f
 4497	4616	0	D:/Emily/lvgl_demo/build/bootloader/esp-idf/esptool_py/CMakeFiles/bootloader_check_size	a8b99f361b943e6f
+8	121	0	esp-idf/esptool_py/CMakeFiles/bootloader_check_size	a8b99f361b943e6f
+8	121	0	D:/Emily/lvgl_demo/build/bootloader/esp-idf/esptool_py/CMakeFiles/bootloader_check_size	a8b99f361b943e6f

@@ -210,9 +210,9 @@ static void mjpeg_stream_task(void *arg)
 
     g_stream_socket = sock;  // 保存socket fd用于强制关闭
 
-    // 设置接收超时20秒，发送超时10秒 (适应慢速网络如手机热点)
-    // 注意: 手机热点可能非常慢，完整帧可能需要15秒以上才能到达
-    struct timeval recv_timeout = { .tv_sec = 20, .tv_usec = 0 };
+    // 设置接收超时25秒，发送超时10秒
+    // 注意: HOME操作电机移动最长20秒期间视频流暂停, 接收超时需大于此值
+    struct timeval recv_timeout = { .tv_sec = 25, .tv_usec = 0 };
     struct timeval send_timeout = { .tv_sec = 10, .tv_usec = 0 };
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
@@ -292,7 +292,7 @@ static void mjpeg_stream_task(void *arg)
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 recv_timeout_count++;
                 if (recv_timeout_count <= 3) {
-                    ESP_LOGW(TAG, "Recv timeout #%d (no data for 20s)", recv_timeout_count);
+                    ESP_LOGW(TAG, "Recv timeout #%d (no data for 25s)", recv_timeout_count);
                 }
                 continue;  // 超时，继续等待
             }

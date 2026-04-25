@@ -162,7 +162,7 @@ static esp_err_t http_start_scan(void)
     esp_http_client_config_t http_cfg = {
         .url = url,
         .method = HTTP_METHOD_POST,
-        .timeout_ms = 5000,
+        .timeout_ms = 10000,
         .buffer_size = 1024,
     };
 
@@ -605,7 +605,28 @@ esp_err_t k230_client_start_scan(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    return http_start_scan();
+    // 暂停视频流释放TCP资源，避免并发HTTP请求时EAGAIN
+    if (g_stream_running) {
+        ESP_LOGI(TAG, "Pausing stream for SCAN request");
+        g_stream_running = false;
+        vTaskDelay(pdMS_TO_TICKS(300));  // 等待流任务停止接收
+    }
+
+    // 发送HTTP请求（带重试）
+    esp_err_t err = http_start_scan();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Scan request failed, retrying in 500ms...");
+        vTaskDelay(pdMS_TO_TICKS(500));
+        err = http_start_scan();
+    }
+
+    // 恢复视频流
+    if (err == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        k230_client_start_stream();
+    }
+
+    return err;
 }
 
 bool k230_client_is_connected(void)

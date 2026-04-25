@@ -1,7 +1,7 @@
 {
     "version":            "1",
     "project_name":       "lvgl_demo",
-    "project_version":    "362af85-dirty",
+    "project_version":    "961cfd2-dirty",
     "project_path":       "D:/Emily/lvgl_demo",
     "idf_path":           "D:/Espressif/frameworks/esp-idf-v5.1.2",
     "build_dir":          "D:/Emily/lvgl_demo/build",

@@ -18,7 +18,11 @@
       "Bash(ls \"D:\\\\Emily\\\\draw_\"*)",
       "Bash(python draw_statemachine.py)",
       "WebSearch",
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "WebFetch(domain:wiki.lckfb.com)",
+      "WebFetch(domain:developer.canaan-creative.com)",
+      "Bash(docker --version)",
+      "Bash(where docker *)"
     ]
   }
 }

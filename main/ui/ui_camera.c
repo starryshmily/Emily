@@ -3,8 +3,8 @@
  * Display K230 video stream and 3D scan progress
  * 视频在顶部居中，按钮在两侧和底部，完全不重叠
  *
- * 状态机: CONNECTING → IDLE → DETECTING → POSITIONING → POS_SUCCESS/POS_FAIL/LIMIT_FAIL
- * CANCEL 可在 DETECTING/POSITIONING/POS_SUCCESS/LIMIT_FAIL 时复位到 IDLE
+ * 状态机: CONNECTING → IDLE → DETECTING → POSITIONING → POS_SUCCESS/POS_FAIL/LIMIT_FAIL → CAPTURING
+ * CANCEL 可在 DETECTING/POSITIONING/POS_SUCCESS/LIMIT_FAIL/CAPTURING 时复位到 IDLE
  *
  * 任何状态下 K230 断开 → CONN_FAIL
  */
@@ -39,11 +39,12 @@ static const char *TAG = "ui_camera";
 #define COLOR_GREEN     0x238636
 #define COLOR_GREEN_UP  0x28A745
 #define COLOR_RED       0xDC3545
+#define COLOR_ORANGE    0xF5A623
 #define COLOR_GRAY      0x555555
 #define COLOR_GRAY_DARK 0x30363D
 
 // 状态机 - 超时定时器
-#define DETECT_TIMEOUT_MS  30000
+#define DETECT_TIMEOUT_MS  60000  // 60秒（扫描模式需要约40秒：0→20cm扫描25秒+返回5秒+定位10秒）
 #define POS_FAIL_DELAY_MS  2000
 
 // 滑块参数
@@ -97,10 +98,16 @@ static volatile bool uart_rx_running = false;
 // 检测超时/延迟定时器
 static esp_timer_handle_t detect_timer = NULL;
 static esp_timer_handle_t force_stop_timer = NULL;
+static esp_timer_handle_t slider_move_timer = NULL;  // 滑块移动超时定时器
 
 // 滑块状态追踪
 static volatile float slider_height_mm = 0.0f;  // 当前高度mm
 static volatile bool slider_moving = false;        // 电机是否在移动中
+static volatile bool cmd_send_lock = false;        // 命令发送锁，防止UP/DOWN重复发送
+static volatile int64_t last_move_send_time_ms = 0; // 上次发送UP/DOWN的时间
+#define MIN_MOVE_INTERVAL_MS 1500  // 两次UP/DOWN最短间隔(ms)，防止触摸抖动双发
+static volatile bool capture_cancelled = false;    // Cancel during CAPTURING, ignore late ALL_DONE
+static volatile bool pending_cancel_capture = false; // Cancel during CAPTURING motor move, wait for HEIGHT then STOP
 static float height_before_calib = 0.0f;  // 校准前的高度（用于校准模式取消）
 
 // K230断开检测
@@ -109,6 +116,14 @@ static volatile int64_t last_frame_time_ms = 0; // 最后一帧时间戳
 // 后台保持连接 - 防止误触返回后重新连接等待太久
 static esp_timer_handle_t delayed_disconnect_timer = NULL;  // 延迟断开定时器
 static volatile bool bg_keepalive_mode = false;  // 后台保活模式
+
+// 线程安全：非LVGL线程通过flag请求主线程执行UI操作
+static volatile camera_state_t pending_state = STATE_CONNECTING;
+static volatile bool has_pending_state = false;
+static volatile bool has_pending_ui_update = false;
+static lv_timer_t *deferred_timer = NULL;
+static char pending_label_text[32] = {0};
+static volatile bool has_pending_label = false;
 
 // 前向声明
 static void video_frame_callback(const uint8_t *jpeg_data, size_t jpeg_len);
@@ -220,20 +235,60 @@ unlock:
     if (locked) xSemaphoreGiveRecursive(lcd_draw_mutex);
 }
 
+// ============== 线程安全：延迟到LVGL主线程执行 ==============
+
+static void deferred_timer_cb(lv_timer_t *timer)
+{
+    if (has_pending_state) {
+        has_pending_state = false;
+        switch_state(pending_state);
+    }
+    if (has_pending_ui_update) {
+        has_pending_ui_update = false;
+        update_up_down_buttons();
+    }
+    if (has_pending_label) {
+        has_pending_label = false;
+        if (label_status) lv_label_set_text(label_status, pending_label_text);
+    }
+}
+
+static void request_state_change(camera_state_t new_state)
+{
+    pending_state = new_state;
+    has_pending_state = true;
+}
+
+static void request_ui_update(void)
+{
+    has_pending_ui_update = true;
+}
+
+static void request_label_update(const char *text)
+{
+    strncpy(pending_label_text, text, sizeof(pending_label_text) - 1);
+    pending_label_text[sizeof(pending_label_text) - 1] = '\0';
+    has_pending_label = true;
+}
+
 // ============== K230断开处理 ==============
 
 static void handle_k230_disconnect(const char *reason)
 {
     ESP_LOGW(TAG, "K230 disconnected: %s (state was %d)", reason, current_state);
     k230_connected = false;
+    if (slider_move_timer) esp_timer_stop(slider_move_timer);
     slider_height_mm = 0;
     slider_moving = false;
+    cmd_send_lock = false;
     pending_move_direction = 0;
+    pending_cancel_capture = false;
+    capture_cancelled = false;
 
     // 同步停止camera_client的流任务，防止recv()在异常socket上操作导致pbuf崩溃
     k230_client_force_stop_stream();
 
-    switch_state(STATE_CONN_FAILED);
+    request_state_change(STATE_CONN_FAILED);
 }
 
 // ============== 状态切换函数 ==============
@@ -262,12 +317,12 @@ static void switch_state(camera_state_t new_state)
 
     case STATE_CONN_FAILED:
         label_status ? lv_label_set_text(label_status, "Failed") : (void)0;
-        set_btn_disabled(btn_start, COLOR_GRAY);
+        lv_label_set_text(label_start, "Reconn");
+        set_btn_style(btn_start, COLOR_ORANGE, true);  // 允许重连
         set_btn_disabled(btn_up, COLOR_GRAY);
         set_btn_disabled(btn_down, COLOR_GRAY);
         set_btn_disabled(btn_zero, COLOR_GRAY);
         set_btn_disabled(btn_cancel, COLOR_GRAY);
-        // 校准按钮隐藏
         if (btn_calibrate) lv_obj_add_flag(btn_calibrate, LV_OBJ_FLAG_HIDDEN);
         break;
 
@@ -314,7 +369,7 @@ static void switch_state(camera_state_t new_state)
         break;
 
     case STATE_POSITIONING:
-        label_status ? lv_label_set_text(label_status, "Position...") : (void)0;
+        label_status ? lv_label_set_text(label_status, "Pos...") : (void)0;
         set_btn_disabled(btn_start, COLOR_GRAY);
         set_btn_disabled(btn_up, COLOR_GRAY);
         set_btn_disabled(btn_down, COLOR_GRAY);
@@ -337,7 +392,7 @@ static void switch_state(camera_state_t new_state)
         break;
 
     case STATE_POS_FAILED:
-        label_status ? lv_label_set_text(label_status, "Pos Failed") : (void)0;
+        label_status ? lv_label_set_text(label_status, "Pos Fail") : (void)0;
         set_btn_disabled(btn_start, COLOR_GRAY);
         set_btn_disabled(btn_up, COLOR_GRAY);
         set_btn_disabled(btn_down, COLOR_GRAY);
@@ -359,6 +414,16 @@ static void switch_state(camera_state_t new_state)
         if (btn_calibrate) lv_obj_add_flag(btn_calibrate, LV_OBJ_FLAG_HIDDEN);
         // 不自动返回IDLE, 等待用户手动CANCEL
         break;
+
+    case STATE_CAPTURING:
+        label_status ? lv_label_set_text(label_status, "Zone 1...") : (void)0;
+        set_btn_disabled(btn_start, COLOR_GRAY);
+        set_btn_disabled(btn_up, COLOR_GRAY);
+        set_btn_disabled(btn_down, COLOR_GRAY);
+        set_btn_disabled(btn_zero, COLOR_GRAY);
+        set_btn_style(btn_cancel, COLOR_RED, true);
+        if (btn_calibrate) lv_obj_add_flag(btn_calibrate, LV_OBJ_FLAG_HIDDEN);
+        break;
     }
 
     if (locked) xSemaphoreGiveRecursive(lcd_draw_mutex);
@@ -369,7 +434,7 @@ static void switch_state(camera_state_t new_state)
 static void force_stop_cb(void *arg)
 {
     ESP_LOGW(TAG, "Force stop: K230 not responding, forcing to IDLE");
-    switch_state(STATE_IDLE);
+    request_state_change(STATE_IDLE);
 }
 
 // ============== 检测超时回调 ==============
@@ -382,6 +447,176 @@ static void detect_timeout_cb(void *arg)
         // 启动强制停止定时器 (5秒后K230没响应则强制切IDLE)
         if (force_stop_timer) {
             esp_timer_start_once(force_stop_timer, 5000000);
+        }
+    }
+}
+
+// ============== 滑块移动超时回调 ==============
+
+static void slider_move_timeout_cb(void *arg)
+{
+    if (slider_moving) {
+        ESP_LOGW(TAG, "Slider move timeout! MOVE:OK not received, resetting slider_moving");
+        slider_moving = false;
+        cmd_send_lock = false;
+        pending_move_direction = 0;
+        request_ui_update();
+    }
+}
+
+// ============== UART消息处理 ==============
+
+static void process_uart_message(const char *clean)
+{
+    if (strncmp(clean, "FOUND:", 6) == 0) {
+        if (current_state == STATE_DETECTING) {
+            request_state_change(STATE_POSITIONING);
+        }
+    } else if (strncmp(clean, "POS:OK", 6) == 0) {
+        const char *p = strchr(clean + 6, ':');
+        if (p) {
+            p++;
+            slider_height_mm = atof(p);
+            ESP_LOGI(TAG, "POS:OK height=%.1fmm", slider_height_mm);
+        }
+        if (current_state == STATE_POSITIONING || current_state == STATE_DETECTING) {
+            if (detect_timer) esp_timer_stop(detect_timer);
+            request_state_change(STATE_POS_SUCCESS);
+        }
+    } else if (strncmp(clean, "POS:LIMIT", 9) == 0) {
+        const char *p = strchr(clean + 9, ':');
+        if (p) {
+            p++;
+            slider_height_mm = atof(p);
+            ESP_LOGI(TAG, "POS:LIMIT height=%.1fmm", slider_height_mm);
+        }
+        if (current_state == STATE_POSITIONING || current_state == STATE_DETECTING) {
+            if (detect_timer) esp_timer_stop(detect_timer);
+            request_state_change(STATE_LIMIT_FAILED);
+        }
+    } else if (strncmp(clean, "MOVE:OK", 7) == 0) {
+        ui_camera_heartbeat();
+
+        slider_moving = false;
+        cmd_send_lock = false;
+        pending_move_direction = 0;
+        if (slider_move_timer) esp_timer_stop(slider_move_timer);
+        const char *h_str = strchr(clean, ':');
+        if (h_str) {
+            h_str++;
+            h_str = strchr(h_str, ':');
+            if (h_str) {
+                h_str++;
+                slider_height_mm = atof(h_str);
+            }
+        }
+        ESP_LOGI(TAG, "MOVE:OK, height=%.1fmm", slider_height_mm);
+        request_ui_update();
+    } else if (strncmp(clean, "HEIGHT:", 7) == 0) {
+        ui_camera_heartbeat();
+
+        if (slider_move_timer) esp_timer_stop(slider_move_timer);
+        slider_moving = false;
+        cmd_send_lock = false;
+        pending_move_direction = 0;
+        slider_height_mm = atof(clean + 7);
+        ESP_LOGI(TAG, "HEIGHT from K230: %.1fmm", slider_height_mm);
+        request_ui_update();
+
+        // 拍摄中Cancel等待: 高度已刷新，现在可以发STOP归零
+        if (pending_cancel_capture) {
+            pending_cancel_capture = false;
+            ESP_LOGI(TAG, "Cancel capture: height refreshed (%.1fmm), sending STOP", slider_height_mm);
+            c3_uart_send(CMD_STOP);
+            request_state_change(STATE_IDLE);
+            if (force_stop_timer) {
+                esp_timer_start_once(force_stop_timer, 5000000);
+            }
+        }
+    } else if (strcmp(clean, "ZERO:OK") == 0) {
+        ui_camera_heartbeat();
+
+        if (slider_move_timer) esp_timer_stop(slider_move_timer);
+        slider_height_mm = 0;
+        pending_move_direction = 0;
+        slider_moving = false;
+        ESP_LOGI(TAG, "ZERO:OK, height reset to 0");
+        request_state_change(STATE_IDLE);
+    } else if (strcmp(clean, "HOME:OK") == 0) {
+        ui_camera_heartbeat();
+
+        if (slider_move_timer) esp_timer_stop(slider_move_timer);
+        slider_height_mm = 0;
+        pending_move_direction = 0;
+        slider_moving = false;
+        ESP_LOGI(TAG, "HOME:OK, height reset to 0");
+        request_ui_update();
+    } else if (strcmp(clean, "STOP:OK") == 0) {
+
+        if (slider_move_timer) esp_timer_stop(slider_move_timer);
+        slider_height_mm = 0;
+        pending_move_direction = 0;
+        slider_moving = false;
+        if (force_stop_timer) {
+            esp_timer_stop(force_stop_timer);
+        }
+        if (current_state != STATE_IDLE) {
+            ESP_LOGI(TAG, "K230 STOP:OK received, switching to IDLE");
+            request_state_change(STATE_IDLE);
+        } else {
+            ESP_LOGI(TAG, "K230 STOP:OK received, already in IDLE");
+            request_ui_update();
+        }
+    } else if (strcmp(clean, "STATE:DETECTING") == 0) {
+        ESP_LOGI(TAG, "K230 confirmed DETECTING state");
+    } else if (strncmp(clean, "CAPTURE:Z", 9) == 0) {
+        if (capture_cancelled) {
+            ESP_LOGI(TAG, "CAPTURE:Z ignored (capture was cancelled)");
+        } else if (pending_cancel_capture) {
+            // Cancel等待中，K230已完成移动和拍照，现在发STOP归零
+            ESP_LOGI(TAG, "Cancel capture: CAPTURE:Z received, sending STOP");
+            pending_cancel_capture = false;
+            c3_uart_send(CMD_STOP);
+            request_state_change(STATE_IDLE);
+            if (force_stop_timer) {
+                esp_timer_start_once(force_stop_timer, 5000000);
+            }
+        } else {
+            ui_camera_heartbeat();
+            int zone_num = clean[9] - '0';
+            if (zone_num >= 1 && zone_num <= 3) {
+                if (current_state != STATE_CAPTURING) {
+                    request_state_change(STATE_CAPTURING);
+                }
+                char zone_text[20];
+                if (clean[10] == ':' && clean[11] != '\0') {
+                    snprintf(zone_text, sizeof(zone_text), "Z%d %s", zone_num, clean + 11);
+                } else {
+                    snprintf(zone_text, sizeof(zone_text), "Zone %d...", zone_num);
+                }
+                if (label_status) request_label_update(zone_text);
+                ESP_LOGI(TAG, "Capture: %s", zone_text);
+            }
+        }
+    } else if (strcmp(clean, "ALL_DONE") == 0 || strcmp(clean, "CANCELLED") == 0) {
+        ui_camera_heartbeat();
+        pending_cancel_capture = false;  // 无论什么情况，清除等待标志
+        if (capture_cancelled || strcmp(clean, "CANCELLED") == 0) {
+            ESP_LOGI(TAG, "Capture %s, sending HOME to return to zero", clean);
+            capture_cancelled = false;
+            // ALL_DONE/CANCELLED意味着拍摄线程已结束，直接发HOME归零
+            // 注意: 必须从UART线程发HOME（c3_uart_send是线程安全的），
+            // 状态切换和UI更新必须通过request函数到LVGL主线程
+            slider_moving = true;
+            pending_move_direction = -1;
+            if (slider_move_timer) esp_timer_start_once(slider_move_timer, 25000000);
+            c3_uart_send("HOME");
+            request_ui_update();
+            request_state_change(STATE_IDLE);
+        } else {
+            ESP_LOGI(TAG, "All zones captured, back to POS_SUCCESS");
+            request_label_update("Scan Done");
+            request_state_change(STATE_POS_SUCCESS);
         }
     }
 }
@@ -405,97 +640,54 @@ static void uart_rx_task(void *arg)
         int len = c3_uart_read(rx_buf, sizeof(rx_buf) - 1, 100);
         if (len > 0) {
             rx_buf[len] = '\0';
-            // 去除\r\n
-            char *clean = rx_buf;
-            while (*clean == '\r' || *clean == '\n') clean++;
-            char *end = clean + strlen(clean) - 1;
-            while (end > clean && (*end == '\r' || *end == '\n')) { *end = '\0'; end--; }
 
-            ESP_LOGI(TAG, "UART RX: [%s]", clean);
+            // 按换行符分割多条消息
+            char *line_start = rx_buf;
+            char *newline = strchr(line_start, '\n');
+            while (newline != NULL) {
+                *newline = '\0';
+                char *clean = line_start;
+                while (*clean == '\r') clean++;  // 跳过前导\r
+                char *end = clean + strlen(clean) - 1;
+                while (end > clean && *end == '\r') { *end = '\0'; end--; }
 
-            if (strncmp(clean, "FOUND:", 6) == 0) {
-                if (current_state == STATE_DETECTING) {
-                    switch_state(STATE_POSITIONING);
+                if (strlen(clean) > 0) {
+                    ESP_LOGI(TAG, "UART RX: [%s]", clean);
+                    process_uart_message(clean);  // 处理单条消息
                 }
-            } else if (strcmp(clean, "POS:OK") == 0) {
-                if (current_state == STATE_POSITIONING) {
-                    switch_state(STATE_POS_SUCCESS);
-                }
-            } else if (strcmp(clean, "POS:LIMIT") == 0) {
-                if (current_state == STATE_POSITIONING) {
-                    switch_state(STATE_LIMIT_FAILED);
-                }
-            } else if (strncmp(clean, "MOVE:OK", 7) == 0) {
-                // 电机移动完成 - 使用K230返回的实际高度
-                ui_camera_heartbeat();  // 更新心跳，防止移动期间视频帧率下降触发超时
-                slider_moving = false;
-                pending_move_direction = 0;
-                // 解析 MOVE:OK:xx.x 格式
-                const char *h_str = strchr(clean, ':');
-                if (h_str) {
-                    h_str++; // 跳过第一个冒号
-                    h_str = strchr(h_str, ':'); // 找第二个冒号
-                    if (h_str) {
-                        h_str++; // 跳过冒号
-                        slider_height_mm = atof(h_str);
-                    }
-                }
-                ESP_LOGI(TAG, "MOVE:OK, height=%.1fmm", slider_height_mm);
-                update_up_down_buttons();
-            } else if (strncmp(clean, "HEIGHT:", 7) == 0) {
-                // K230返回当前高度 (连接时查询)
-                ui_camera_heartbeat();
-                const char *h_val = clean + 7;
-                slider_height_mm = atof(h_val);
-                ESP_LOGI(TAG, "HEIGHT from K230: %.1fmm", slider_height_mm);
-                update_up_down_buttons();
-            } else if (strcmp(clean, "ZERO:OK") == 0) {
-                // K230确认当前位置已归零
-                ui_camera_heartbeat();  // 更新心跳
-                slider_height_mm = 0;
-                pending_move_direction = 0;
-                slider_moving = false;
-                ESP_LOGI(TAG, "ZERO:OK, height reset to 0");
-                switch_state(STATE_IDLE);  // 退出校准，回到IDLE
-            } else if (strcmp(clean, "HOME:OK") == 0) {
-                // K230归零完成
-                ui_camera_heartbeat();  // 更新心跳，防止超时
-                slider_height_mm = 0;
-                pending_move_direction = 0;
-                slider_moving = false;
-                ESP_LOGI(TAG, "HOME:OK, height reset to 0");
-                update_up_down_buttons();  // 恢复按钮状态
-            } else if (strcmp(clean, "STOP:OK") == 0) {
-                // K230复位完成
-                slider_height_mm = 0;
-                pending_move_direction = 0;
-                slider_moving = false;
-                if (force_stop_timer) {
-                    esp_timer_stop(force_stop_timer);
-                }
-                if (current_state != STATE_IDLE) {
-                    ESP_LOGI(TAG, "K230 STOP:OK received, switching to IDLE");
-                    switch_state(STATE_IDLE);
-                } else {
-                    ESP_LOGI(TAG, "K230 STOP:OK received, already in IDLE");
-                    update_up_down_buttons();
-                }
-            } else if (strcmp(clean, "STATE:DETECTING") == 0) {
-                // K230确认进入检测模式 (调试用)
-                ESP_LOGI(TAG, "K230 confirmed DETECTING state");
+
+                line_start = newline + 1;
+                newline = strchr(line_start, '\n');
             }
+            // 处理缓冲区末尾没有换行的残留数据
+            if (strlen(line_start) > 0) {
+                char *clean = line_start;
+                while (*clean == '\r') clean++;
+                char *end = clean + strlen(clean) - 1;
+                while (end > clean && *end == '\r') { *end = '\0'; end--; }
+                if (strlen(clean) > 0) {
+                    ESP_LOGI(TAG, "UART RX (partial): [%s]", clean);
+                    process_uart_message(clean);
+                }
+            }
+        } else if (len < 0) {
+            // UART读取错误
         }
 
         // 检测K230断开 (视频流超时)
-        // 注意: YOLO模式下视频流暂停是正常的, 不检测超时
+        // 注意: motor_busy时视频流暂停是正常的, 不检测超时
+        // 同时, slider_moving为true时也不检测(用户正在调整高度)
         if (k230_connected &&
+            !slider_moving &&
             current_state != STATE_CONNECTING &&
             current_state != STATE_CONN_FAILED &&
+            current_state != STATE_CALIBRATING &&
             current_state != STATE_DETECTING &&
             current_state != STATE_POSITIONING &&
             current_state != STATE_POS_SUCCESS &&
             current_state != STATE_LIMIT_FAILED &&
-            current_state != STATE_POS_FAILED) {
+            current_state != STATE_POS_FAILED &&
+            current_state != STATE_CAPTURING) {
             int64_t now = esp_timer_get_time() / 1000;
             if (last_frame_time_ms > 0 && (now - last_frame_time_ms) > STREAM_TIMEOUT_MS) {
                 handle_k230_disconnect("stream timeout");
@@ -525,7 +717,7 @@ static void k230_connect_task(void *arg)
     esp_err_t err = k230_client_init(&k230_config, progress_callback);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "K230 init failed: %s", esp_err_to_name(err));
-        switch_state(STATE_CONN_FAILED);
+        request_state_change(STATE_CONN_FAILED);
         k230_connect_task_handle = NULL;
         vTaskDelete(NULL);
         return;
@@ -537,7 +729,7 @@ static void k230_connect_task(void *arg)
     err = k230_client_connect();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Connection failed: %s", esp_err_to_name(err));
-        switch_state(STATE_CONN_FAILED);
+        request_state_change(STATE_CONN_FAILED);
         k230_connect_task_handle = NULL;
         vTaskDelete(NULL);
         return;
@@ -584,7 +776,7 @@ static void video_frame_callback(const uint8_t *jpeg_data, size_t jpeg_len)
     if (!first_frame_received) {
         first_frame_received = true;
         ESP_LOGI(TAG, "First frame received, switching to IDLE");
-        switch_state(STATE_IDLE);
+        request_state_change(STATE_IDLE);
     }
 
     if (xSemaphoreTake(video_mutex, pdMS_TO_TICKS(5)) != pdTRUE) {
@@ -711,7 +903,21 @@ static void btn_start_callback(lv_event_t *e)
         switch_state(STATE_DETECTING);
     } else if (current_state == STATE_POS_SUCCESS || current_state == STATE_LIMIT_FAILED) {
         ESP_LOGI(TAG, "Scan: sending START_SCAN to K230");
+        capture_cancelled = false;  // 重置取消标志，开始新的扫描
+        pending_cancel_capture = false;
         k230_client_start_scan();
+    } else if (current_state == STATE_CONN_FAILED) {
+        ESP_LOGI(TAG, "Reconnect: restarting connection to K230");
+        first_frame_received = false;  // 重置首帧标志，允许新连接触发IDLE切换
+        // 停止旧的UART任务
+        uart_rx_running = false;
+        if (uart_rx_task_handle) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            uart_rx_task_handle = NULL;
+        }
+        k230_client_force_stop_stream();
+        switch_state(STATE_CONNECTING);
+        xTaskCreate(k230_connect_task, "k230_conn", 8192, NULL, 5, &k230_connect_task_handle);
     }
 }
 
@@ -738,22 +944,46 @@ static void btn_cancel_callback(lv_event_t *e)
         }
     } else if (current_state == STATE_POS_SUCCESS || current_state == STATE_LIMIT_FAILED ||
                current_state == STATE_POS_FAILED) {
-        // K230已经退出YOLO模式，直接切IDLE恢复视频流
-        ESP_LOGI(TAG, "Cancel: returning to IDLE");
+        // K230已退出YOLO，但滑块可能在非零位置，发送HOME归零
+        ESP_LOGI(TAG, "Cancel: sending HOME to return slider to zero");
+        slider_moving = true;
+        pending_move_direction = -1;  // HOME = going down to 0
+        update_up_down_buttons();
+        if (slider_move_timer) esp_timer_start_once(slider_move_timer, 25000000);  // 25s for HOME
+                c3_uart_send("HOME");
         switch_state(STATE_IDLE);
+    } else if (current_state == STATE_CAPTURING) {
+        // 拍摄中取消: 不立即发STOP，等当前移动完成(HEIGHT消息)后再发
+        // 避免电机中途停下导致高度未刷新，归零不准
+        ESP_LOGI(TAG, "Cancel capture: waiting for current move to finish before STOP");
+        capture_cancelled = true;  // 标记已取消，忽略后续ALL_DONE
+        pending_cancel_capture = true;  // 等HEIGHT/CAPTURE:Z到达后再发STOP
+        if (label_status) request_label_update("Cancel...");
     }
 }
 
 static void btn_up_callback(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (slider_moving) return;
+    if (slider_moving || cmd_send_lock) return;
+
+    // 防抖：距上次发送UP/DOWN不足1.5秒则忽略
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    if (last_move_send_time_ms > 0 && (now_ms - last_move_send_time_ms) < MIN_MOVE_INTERVAL_MS) {
+        ESP_LOGW(TAG, "UP debounced (%lldms < %dms)", now_ms - last_move_send_time_ms, MIN_MOVE_INTERVAL_MS);
+        return;
+    }
 
     // 校准模式: 无行程限制
     if (current_state == STATE_CALIBRATING) {
         ESP_LOGI(TAG, "CAL UP (no limit)");
+        cmd_send_lock = true;
         slider_moving = true;
+        pending_move_direction = 1;
         update_up_down_buttons();
+        if (slider_move_timer) esp_timer_start_once(slider_move_timer, 5000000);
+        last_move_send_time_ms = now_ms;
+
         c3_uart_send(CMD_UP);
         return;
     }
@@ -762,8 +992,13 @@ static void btn_up_callback(lv_event_t *e)
         current_state == STATE_LIMIT_FAILED) {
         if (slider_height_mm < SLIDER_UP_LIMIT_MM) {
             ESP_LOGI(TAG, "UP: sending UP to K230 (height=%.1fmm)", slider_height_mm);
+            cmd_send_lock = true;
             slider_moving = true;
+            pending_move_direction = 1;
             update_up_down_buttons();
+            if (slider_move_timer) esp_timer_start_once(slider_move_timer, 5000000);
+            last_move_send_time_ms = now_ms;
+    
             c3_uart_send(CMD_UP);
         }
     }
@@ -772,14 +1007,25 @@ static void btn_up_callback(lv_event_t *e)
 static void btn_down_callback(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (slider_moving) return;
+    if (slider_moving || cmd_send_lock) return;
+
+    // 防抖：距上次发送UP/DOWN不足1.5秒则忽略
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    if (last_move_send_time_ms > 0 && (now_ms - last_move_send_time_ms) < MIN_MOVE_INTERVAL_MS) {
+        ESP_LOGW(TAG, "DOWN debounced (%lldms < %dms)", now_ms - last_move_send_time_ms, MIN_MOVE_INTERVAL_MS);
+        return;
+    }
 
     // 校准模式: 无行程限制
     if (current_state == STATE_CALIBRATING) {
         ESP_LOGI(TAG, "CAL DOWN (no limit)");
+        cmd_send_lock = true;
         slider_moving = true;
+        pending_move_direction = -1;
         update_up_down_buttons();
-        c3_uart_send(CMD_DOWN);
+        if (slider_move_timer) esp_timer_start_once(slider_move_timer, 5000000);
+        last_move_send_time_ms = now_ms;
+                c3_uart_send(CMD_DOWN);
         return;
     }
 
@@ -787,10 +1033,13 @@ static void btn_down_callback(lv_event_t *e)
         current_state == STATE_LIMIT_FAILED) {
         if (slider_height_mm > 0.0f) {
             ESP_LOGI(TAG, "DOWN: sending DOWN to K230 (height=%.1fmm)", slider_height_mm);
+            cmd_send_lock = true;
             slider_moving = true;
             pending_move_direction = -1;
             update_up_down_buttons();
-            c3_uart_send(CMD_DOWN);
+            if (slider_move_timer) esp_timer_start_once(slider_move_timer, 5000000);
+            last_move_send_time_ms = now_ms;
+                        c3_uart_send(CMD_DOWN);
         }
     }
 }
@@ -809,8 +1058,10 @@ static void btn_zero_callback(lv_event_t *e)
         if (slider_height_mm > 0.0f) {
             ESP_LOGI(TAG, "ZERO: sending HOME to K230 (height=%.1fmm)", slider_height_mm);
             slider_moving = true;
-            update_up_down_buttons();  // UP/DOWN/Zero都变灰
-            c3_uart_send("HOME");
+            pending_move_direction = -1;  // HOME = going down to 0
+            update_up_down_buttons();
+            if (slider_move_timer) esp_timer_start_once(slider_move_timer, 25000000);  // 25s for HOME
+                        c3_uart_send("HOME");
         }
     }
 }
@@ -898,6 +1149,17 @@ void ui_camera_create(void)
         .dispatch_method = ESP_TIMER_TASK,
     };
     esp_timer_create(&force_timer_args, &force_stop_timer);
+
+    // 创建滑块移动超时定时器
+    esp_timer_create_args_t move_timer_args = {
+        .callback = slider_move_timeout_cb,
+        .name = "slider_move_timer",
+        .dispatch_method = ESP_TIMER_TASK,
+    };
+    esp_timer_create(&move_timer_args, &slider_move_timer);
+
+    // 创建LVGL timer用于线程安全延迟执行UI操作 (50ms检查一次)
+    deferred_timer = lv_timer_create(deferred_timer_cb, 50, NULL);
 
     ESP_LOGI(TAG, "Video: %dx%d at (%d,%d)", VIDEO_W, VIDEO_H, VIDEO_POS_X, VIDEO_POS_Y);
 
@@ -1094,18 +1356,37 @@ void ui_camera_handle_k230_status(const char *status_str)
 {
     if (strncmp(status_str, "FOUND:", 6) == 0) {
         if (current_state == STATE_DETECTING) {
-            switch_state(STATE_POSITIONING);
+            request_state_change(STATE_POSITIONING);
         }
     } else if (strcmp(status_str, "POS:OK") == 0) {
         if (current_state == STATE_POSITIONING) {
-            switch_state(STATE_POS_SUCCESS);
+            request_state_change(STATE_POS_SUCCESS);
         }
     } else if (strcmp(status_str, "POS:LIMIT") == 0) {
         if (current_state == STATE_POSITIONING) {
-            switch_state(STATE_LIMIT_FAILED);
+            request_state_change(STATE_LIMIT_FAILED);
         }
     } else if (strcmp(status_str, "STOP:OK") == 0) {
-        switch_state(STATE_IDLE);
+        request_state_change(STATE_IDLE);
+    } else if (strncmp(status_str, "CAPTURE:Z", 9) == 0) {
+        if (capture_cancelled) return;
+        if (current_state != STATE_CAPTURING) {
+            request_state_change(STATE_CAPTURING);
+        }
+        int zone_num = status_str[9] - '0';
+        if (zone_num >= 1 && zone_num <= 3) {
+            char zone_text[16];
+            snprintf(zone_text, sizeof(zone_text), "Zone %d...", zone_num);
+            if (label_status) request_label_update(zone_text);
+        }
+    } else if (strcmp(status_str, "ALL_DONE") == 0) {
+        if (capture_cancelled) {
+            ESP_LOGI(TAG, "ALL_DONE ignored due to previous cancel");
+            capture_cancelled = false;
+            return;
+        }
+        request_label_update("Scan Done");
+        request_state_change(STATE_POS_SUCCESS);
     }
 }
 

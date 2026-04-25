@@ -1,7 +1,7 @@
 /**
  * Camera页面UI
  * 显示K230视频流和3D扫描进度
- * 状态机: CONNECTING → IDLE → DETECTING → POSITIONING → POS_SUCCESS/POS_FAIL/LIMIT_FAIL
+ * 状态机: CONNECTING → IDLE → DETECTING → POSITIONING → POS_SUCCESS/POS_FAIL/LIMIT_FAIL → CAPTURING
  */
 
 #ifndef UI_CAMERA_H
@@ -25,6 +25,7 @@ typedef enum {
     STATE_POS_SUCCESS,    // 定位成功 (Pos Succ)
     STATE_POS_FAILED,     // 检测超时失败 (Pos Failed)
     STATE_LIMIT_FAILED,   // 滑块极限失败 (Max H)
+    STATE_CAPTURING,      // 三区域拍摄中 (Zone X...)
 } camera_state_t;
 
 /**

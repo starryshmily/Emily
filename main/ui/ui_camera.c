@@ -569,6 +569,9 @@ static void process_uart_message(const char *clean)
         }
     } else if (strcmp(clean, "STATE:DETECTING") == 0) {
         ESP_LOGI(TAG, "K230 confirmed DETECTING state");
+        if (current_state != STATE_DETECTING) {
+            request_state_change(STATE_DETECTING);
+        }
     } else if (strncmp(clean, "CAPTURE:Z", 9) == 0) {
         if (capture_cancelled) {
             ESP_LOGI(TAG, "CAPTURE:Z ignored (capture was cancelled)");

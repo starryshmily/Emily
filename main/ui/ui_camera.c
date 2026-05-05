@@ -1600,16 +1600,10 @@ static void btn_cancel_callback(lv_event_t *e)
         switch_state(STATE_IDLE);
     } else if (current_state == STATE_UPLOAD_READY || current_state == STATE_UPLOADING ||
                current_state == STATE_UPLOAD_FAILED || current_state == STATE_MODEL_DONE) {
-        ESP_LOGI(TAG, "Cancel upload/model state: sending HOME and returning IDLE");
-        preview_mode = false;
-
-        if (label_pic_zone) lv_obj_add_flag(label_pic_zone, LV_OBJ_FLAG_HIDDEN);
-        slider_moving = true;
-        pending_move_direction = -1;
-        update_up_down_buttons();
-        if (slider_move_timer) esp_timer_start_once(slider_move_timer, 25000000);
-        c3_uart_send("HOME");
-        switch_state(STATE_IDLE);
+        // Cancel upload: go back to preview state, re-download photos
+        preview_free_cache();
+        preview_cache_ready = false;
+        switch_state(STATE_UPLOAD_READY);
     } else if (current_state == STATE_CAPTURING) {
         // 拍摄中取消: 不立即发STOP，等当前移动完成(HEIGHT消息)后再发
         // 避免电机中途停下导致高度未刷新，归零不准
@@ -2015,7 +2009,7 @@ void ui_camera_create(void)
     upload_panel = lv_obj_create(screen_camera);
     lv_obj_set_size(upload_panel, VIDEO_W, VIDEO_H);
     lv_obj_set_pos(upload_panel, VIDEO_POS_X, VIDEO_POS_Y);
-    lv_obj_set_style_bg_color(upload_panel, lv_color_white(), 0);
+    lv_obj_set_style_bg_color(upload_panel, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(upload_panel, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(upload_panel, 0, 0);
     lv_obj_set_style_radius(upload_panel, 0, 0);
@@ -2031,10 +2025,10 @@ void ui_camera_create(void)
     lv_arc_set_rotation(upload_arc, 270);
     lv_arc_set_value(upload_arc, 0);
     lv_obj_set_style_arc_width(upload_arc, 12, LV_PART_MAIN);
-    lv_obj_set_style_arc_color(upload_arc, lv_color_hex(0xE9EDF9), LV_PART_MAIN);
+    lv_obj_set_style_arc_color(upload_arc, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
     lv_obj_set_style_arc_rounded(upload_arc, true, LV_PART_MAIN);
     lv_obj_set_style_arc_width(upload_arc, 12, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(upload_arc, lv_color_hex(0x2F80ED), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(upload_arc, lv_color_hex(0x28A745), LV_PART_INDICATOR);
     lv_obj_set_style_arc_rounded(upload_arc, true, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(upload_arc, LV_OPA_TRANSP, LV_PART_KNOB);
     lv_obj_set_style_pad_all(upload_arc, 0, LV_PART_KNOB);
@@ -2044,7 +2038,7 @@ void ui_camera_create(void)
     upload_percent_label = lv_label_create(screen_camera);
     lv_label_set_text(upload_percent_label, "0%");
     lv_obj_set_style_text_font(upload_percent_label, &lv_font_montserrat_24, 0);
-    lv_obj_set_style_text_color(upload_percent_label, lv_color_black(), 0);
+    lv_obj_set_style_text_color(upload_percent_label, lv_color_hex(0xAAAAAA), 0);
     lv_obj_align_to(upload_percent_label, upload_arc, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_flag(upload_percent_label, LV_OBJ_FLAG_HIDDEN);
 
@@ -2053,7 +2047,7 @@ void ui_camera_create(void)
     lv_obj_set_width(upload_stage_label, VIDEO_W - 12);
     lv_label_set_long_mode(upload_stage_label, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_font(upload_stage_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(upload_stage_label, lv_color_hex(0x4B5563), 0);
+    lv_obj_set_style_text_color(upload_stage_label, lv_color_hex(0xAAAAAA), 0);
     lv_obj_set_style_text_align(upload_stage_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_pos(upload_stage_label, VIDEO_POS_X + 6, VIDEO_POS_Y + 188);
     lv_obj_add_flag(upload_stage_label, LV_OBJ_FLAG_HIDDEN);

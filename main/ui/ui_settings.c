@@ -8,6 +8,7 @@
 #include "ui_brightness.h"
 #include "ui_about.h"
 #include "ui_wifi.h"
+#include "ui_developer.h"
 #include "esp_log.h"
 
 static const char *TAG = "ui_settings";
@@ -17,6 +18,7 @@ static void btn_back_callback(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
     if(code == LV_EVENT_CLICKED) {
+        ui_home_refresh_developer_status();
         lv_scr_load(ui_home_get_screen());
     }
 }
@@ -42,6 +44,14 @@ static void wifi_callback(lv_event_t *e)
     lv_event_code_t code = lv_event_get_code(e);
     if(code == LV_EVENT_CLICKED) {
         ui_wifi_create();
+    }
+}
+
+static void developer_callback(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if(code == LV_EVENT_CLICKED) {
+        ui_developer_create();
     }
 }
 
@@ -106,6 +116,12 @@ void ui_settings_create(void)
     lv_obj_set_height(btn_brightness, 55);
     lv_obj_set_style_pad_all(btn_brightness, 12, 0);
     lv_obj_add_event_cb(btn_brightness, brightness_callback, LV_EVENT_ALL, NULL);
+
+    lv_obj_t *btn_developer = lv_list_add_btn(list, LV_SYMBOL_SETTINGS, "Developer Mode");
+    lv_obj_set_style_text_font(btn_developer, &lv_font_montserrat_16, 0);
+    lv_obj_set_height(btn_developer, 55);
+    lv_obj_set_style_pad_all(btn_developer, 12, 0);
+    lv_obj_add_event_cb(btn_developer, developer_callback, LV_EVENT_ALL, NULL);
 
     // About选项
     lv_obj_t *btn_about = lv_list_add_btn(list, LV_SYMBOL_SETTINGS, "About");

@@ -417,6 +417,23 @@ void app_main_wifi_disconnect(void)
     esp_wifi_disconnect();
 }
 
+void app_main_prepare_wifi_scan(void)
+{
+    ESP_LOGI(TAG, "Preparing WiFi scan: stop pending connect/reconnect");
+    allow_auto_reconnect = false;
+    auto_reconnect_count = 0;
+    is_manual_connect = false;
+    esp_wifi_disconnect();
+}
+
+void app_main_stop_wifi_reconnect(void)
+{
+    ESP_LOGI(TAG, "Stopping WiFi reconnect attempts");
+    allow_auto_reconnect = false;
+    auto_reconnect_count = 0;
+    is_manual_connect = false;
+}
+
 // Trigger auto-connect to saved WiFi (boot time, limited retries)
 void app_main_auto_connect_wifi(void)
 {

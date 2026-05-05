@@ -15,6 +15,13 @@ file(GLOB_RECURSE srcs *.c
                     generated/images/*.c
                     )
 
+list(APPEND srcs
+    developer_mode.c
+    history_store.c
+    ui/ui_developer.c
+    ui/ui_history.c
+    )
+
 set(include_dirs
     .
     ui

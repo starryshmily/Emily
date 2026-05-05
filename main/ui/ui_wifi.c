@@ -18,6 +18,8 @@ extern int get_last_disconnect_reason(void);
 extern void app_main_get_connected_ssid(char *ssid, size_t max_len);
 extern void app_main_wifi_disconnect(void);
 extern void app_main_trigger_wifi_connect(void);
+extern void app_main_prepare_wifi_scan(void);
+extern void app_main_stop_wifi_reconnect(void);
 
 static const char *TAG = "ui_wifi";
 
@@ -39,6 +41,8 @@ static bool is_connecting = false;
 static bool is_returning = false;
 static bool wifi_initialized = false;
 static bool scan_in_progress = false;  // Track if scan is running
+static bool pending_auto_connect_after_scan = false;
+static int scan_retry_count = 0;
 static char connected_ssid[33] = {0};  // Currently connected SSID
 
 // WiFi AP data - show only top 10 to save memory
@@ -74,6 +78,7 @@ static void msgbox_close_cb(lv_event_t *e);
 static void do_wifi_scan(void);
 static void do_wifi_scan_timer(lv_timer_t *t);
 static void disconnect_confirm_cb(lv_event_t *e);
+static void maybe_trigger_auto_connect_after_scan(void);
 
 // Animation callback for button zoom
 static void btn_zoom_anim_cb(void *obj, int32_t value)
@@ -134,8 +139,10 @@ static void refresh_btn_cb(lv_event_t *e)
         }
         ap_count = 0;
 
-        // Delay scan to allow button animation to complete
-        scan_timer = lv_timer_create(do_wifi_scan_timer, 200, NULL);
+        app_main_prepare_wifi_scan();
+
+        // Delay scan to allow button animation and WiFi disconnect to complete
+        scan_timer = lv_timer_create(do_wifi_scan_timer, 1200, NULL);
         lv_timer_set_repeat_count(scan_timer, 1);  // Run only once
     }
 }
@@ -145,6 +152,19 @@ static void do_wifi_scan_timer(lv_timer_t *t)
 {
     scan_timer = NULL;  // Clear timer pointer
     do_wifi_scan();
+}
+
+static void maybe_trigger_auto_connect_after_scan(void)
+{
+    if(!pending_auto_connect_after_scan) {
+        return;
+    }
+
+    pending_auto_connect_after_scan = false;
+    if(!app_main_is_wifi_connected()) {
+        ESP_LOGI(TAG, "Scan finished, triggering saved WiFi auto-connect");
+        app_main_trigger_wifi_connect();
+    }
 }
 
 // Perform WiFi scan and display results
@@ -181,14 +201,33 @@ static void do_wifi_scan(void)
         ESP_LOGE(TAG, "WiFi scan failed: %s", esp_err_to_name(ret));
         scan_in_progress = false;
 
+        if(ret == ESP_ERR_WIFI_STATE && scan_retry_count < 2) {
+            scan_retry_count++;
+            ESP_LOGW(TAG, "WiFi is busy connecting, retry scan later (%d/2)", scan_retry_count);
+            if(label_status) {
+                lv_label_set_text(label_status, "WiFi busy...");
+                lv_obj_set_style_text_color(label_status, lv_palette_main(LV_PALETTE_ORANGE), 0);
+            }
+            if(scan_timer) {
+                lv_timer_del(scan_timer);
+                scan_timer = NULL;
+            }
+            scan_timer = lv_timer_create(do_wifi_scan_timer, 1200, NULL);
+            lv_timer_set_repeat_count(scan_timer, 1);
+            return;
+        }
+
+        scan_retry_count = 0;
+
         if(label_status) {
-            lv_label_set_text(label_status, "Scan failed");
+            lv_label_set_text(label_status, "WiFi busy");
             lv_obj_set_style_text_color(label_status, lv_palette_main(LV_PALETTE_RED), 0);
         }
         return;
     }
 
     ESP_LOGI(TAG, "WiFi scan completed successfully");
+    scan_retry_count = 0;
 
     // Get currently connected SSID
     app_main_get_connected_ssid(connected_ssid, sizeof(connected_ssid));
@@ -241,6 +280,8 @@ static void do_wifi_scan(void)
             lv_obj_set_style_text_color(label_status, lv_palette_main(LV_PALETTE_RED), 0);
         }
     }
+
+    maybe_trigger_auto_connect_after_scan();
 }
 
 // Keyboard slide-in animation callback (bottom to top) - LVGL 8.x compatible
@@ -282,6 +323,7 @@ static void wifi_back_cb(lv_event_t *e)
         is_returning = true;
 
         ESP_LOGI(TAG, "WiFi back button clicked");
+        app_main_stop_wifi_reconnect();
 
         // Stop all timers first
         if(refresh_timer) {
@@ -799,6 +841,9 @@ void ui_wifi_create(void)
     scan_in_progress = false;  // 确保重置扫描状态
     ap_count = 0;
 
+    pending_auto_connect_after_scan = false;
+    scan_retry_count = 0;
+
     // Create WiFi page
     screen_wifi = lv_obj_create(NULL);
     lv_obj_set_size(screen_wifi, 240, 320);
@@ -833,9 +878,9 @@ void ui_wifi_create(void)
     lv_obj_set_pos(btn_refresh, 195, 5);    // Adjusted position
     lv_obj_set_style_bg_color(btn_refresh, lv_color_hex(0x2195F6), 0);
     lv_obj_set_style_radius(btn_refresh, 20, 0);  // Radius = half of size
-    lv_obj_set_style_shadow_width(btn_refresh, 3, 0);
-    lv_obj_set_style_shadow_opa(btn_refresh, LV_OPA_30, 0);
-    lv_obj_set_style_shadow_ofs_y(btn_refresh, 2, 0);
+    lv_obj_set_style_shadow_width(btn_refresh, 0, 0);
+    lv_obj_set_style_shadow_opa(btn_refresh, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_shadow_ofs_y(btn_refresh, 0, 0);
 
     lv_obj_t *refresh_label = lv_label_create(btn_refresh);
     lv_label_set_text(refresh_label, LV_SYMBOL_REFRESH);
@@ -892,8 +937,9 @@ void ui_wifi_create(void)
 
     if(!is_connected) {
         // WiFi未连接：尝试连接已保存的WiFi（只尝试1次）
-        ESP_LOGI(TAG, "WiFi not connected, triggering auto-connect");
-        app_main_trigger_wifi_connect();
+        ESP_LOGI(TAG, "WiFi not connected, will auto-connect after scan");
+        pending_auto_connect_after_scan = true;
+        app_main_prepare_wifi_scan();
     } else {
         ESP_LOGI(TAG, "WiFi already connected, skipping trigger");
     }
@@ -906,6 +952,7 @@ void ui_wifi_create(void)
 
     // 延迟扫描，让UI先渲染完成
     scan_timer = lv_timer_create(do_wifi_scan_timer, 100, NULL);
+    lv_timer_set_period(scan_timer, 1200);
     lv_timer_set_repeat_count(scan_timer, 1);
 
     wifi_initialized = true;

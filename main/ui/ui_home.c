@@ -9,8 +9,9 @@
 #include "ui_settings.h"
 #include "ui_about.h"
 #include "ui_camera.h"
+#include "ui_history.h"
+#include "developer_mode.h"
 #include "gxhtc3.h"
-#include "../c3_uart.h"
 #include <stdio.h>
 
 // External functions from main.c
@@ -22,7 +23,7 @@ static lv_obj_t *screen_home = NULL;
 // 动画状态
 static lv_obj_t *btn_camera = NULL;
 static lv_obj_t *btn_temp = NULL;
-static lv_obj_t *btn_xiaozhi = NULL;
+static lv_obj_t *btn_history = NULL;
 static lv_obj_t *btn_settings = NULL;
 static float pre_measured_temp = 25.0f;
 static bool is_animating = false;
@@ -31,7 +32,9 @@ static bool is_animating = false;
 static lv_obj_t *anim_mask = NULL;
 static lv_obj_t *anim_mask_icon = NULL;
 static lv_obj_t *anim_mask_label = NULL;
-static int target_page = 0;  // 0=none, 1=camera, 2=temp, 3=xiaozhi, 4=settings
+static lv_timer_t *history_delay_timer = NULL;
+static lv_obj_t *history_loading_screen = NULL;
+static int target_page = 0;  // 0=none, 1=camera, 2=temp, 3=history, 4=settings
 
 // 保存按钮原始位置和大小
 static int32_t anim_start_x = 0;
@@ -41,8 +44,53 @@ static int32_t anim_start_h = 90;
 
 // WiFi状态指示器
 static lv_obj_t *wifi_status_label = NULL;
+static lv_obj_t *developer_status_label = NULL;
 
 // 动画执行回调 - 改变遮罩大小和位置 (250ms优化)
+static void history_delay_timer_cb(lv_timer_t *timer)
+{
+    lv_timer_del(timer);
+    history_delay_timer = NULL;
+    lv_obj_t *old_loading = history_loading_screen;
+    history_loading_screen = NULL;
+    ui_history_create();
+    if(old_loading) {
+        lv_obj_del_async(old_loading);
+    }
+    is_animating = false;
+}
+
+static void show_history_loading_screen(void)
+{
+    if(history_loading_screen) {
+        lv_obj_del_async(history_loading_screen);
+        history_loading_screen = NULL;
+    }
+
+    history_loading_screen = lv_obj_create(NULL);
+    lv_obj_set_size(history_loading_screen, 240, 320);
+    lv_obj_set_scrollbar_mode(history_loading_screen, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_style_bg_color(history_loading_screen, lv_color_hex(0xF0F4F8), 0);
+    lv_obj_set_style_bg_opa(history_loading_screen, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(history_loading_screen, 0, 0);
+    lv_obj_set_style_shadow_width(history_loading_screen, 0, 0);
+    lv_obj_set_style_radius(history_loading_screen, 0, 0);
+
+    lv_obj_t *title = lv_label_create(history_loading_screen);
+    lv_label_set_text(title, "History");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0x1A237E), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 16);
+
+    lv_obj_t *loading = lv_label_create(history_loading_screen);
+    lv_label_set_text(loading, "Loading...");
+    lv_obj_set_style_text_font(loading, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(loading, lv_color_hex(0x6B7280), 0);
+    lv_obj_align(loading, LV_ALIGN_CENTER, 0, 0);
+
+    lv_scr_load(history_loading_screen);
+}
+
 static void anim_expand_cb(void *var, int32_t v)
 {
     lv_obj_t *mask = (lv_obj_t *)var;
@@ -83,6 +131,22 @@ static void anim_ready_cb(lv_anim_t *a)
     }
 
     // 删除遮罩
+    if(target_page == 3) {
+        show_history_loading_screen();
+        if(anim_mask) {
+            lv_obj_del(anim_mask);
+            anim_mask = NULL;
+        }
+        anim_mask_icon = NULL;
+        anim_mask_label = NULL;
+        target_page = 0;
+        if(history_delay_timer) {
+            lv_timer_del(history_delay_timer);
+        }
+        history_delay_timer = lv_timer_create(history_delay_timer_cb, 50, NULL);
+        return;
+    }
+
     if(anim_mask) {
         lv_obj_del(anim_mask);
         anim_mask = NULL;
@@ -98,14 +162,6 @@ static void anim_ready_cb(lv_anim_t *a)
         case 2:  // Temp
             ui_temp_create_with_temp(pre_measured_temp);
             break;
-        case 3:  // XiaoZhi
-        {
-            // 发送UART通知到K230，蜂鸣器响1秒
-            c3_uart_send_xiaozhi();
-            static const char *btns[] = {"OK", ""};
-            lv_msgbox_create(NULL, "XiaoZhi AI", "Notification sent!\nK230 buzzer beeping...", btns, true);
-            break;
-        }
         case 4:  // Settings
             ui_settings_create();
             break;
@@ -198,11 +254,11 @@ static void btn_temp_callback(lv_event_t *e)
     }
 }
 
-static void btn_xiaozhi_callback(lv_event_t *e)
+static void btn_history_callback(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
     if(code == LV_EVENT_CLICKED) {
-        start_button_animation(btn_xiaozhi, 3);
+        start_button_animation(btn_history, 3);
     }
 }
 
@@ -227,9 +283,9 @@ static lv_obj_t* create_menu_btn(lv_obj_t *parent, const char *icon_text, const 
     lv_obj_set_style_bg_grad_color(btn, lv_color_lighten(bg_color, 50), 0);
     lv_obj_set_style_bg_grad_dir(btn, LV_GRAD_DIR_VER, 0);
     lv_obj_set_style_radius(btn, 18, 0);
-    lv_obj_set_style_shadow_width(btn, 10, 0);
-    lv_obj_set_style_shadow_opa(btn, LV_OPA_30, 0);
-    lv_obj_set_style_shadow_ofs_y(btn, 5, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_set_style_shadow_opa(btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_shadow_ofs_y(btn, 0, 0);
     lv_obj_set_style_bg_color(btn, lv_color_darken(bg_color, 30), LV_STATE_PRESSED);
 
     // 图标 (上方) - 使用48号大字体
@@ -260,9 +316,9 @@ static lv_obj_t* create_temp_btn(lv_obj_t *parent, const char *label_text, int c
     lv_obj_set_style_bg_grad_color(btn, lv_color_lighten(bg_color, 50), 0);
     lv_obj_set_style_bg_grad_dir(btn, LV_GRAD_DIR_VER, 0);
     lv_obj_set_style_radius(btn, 18, 0);
-    lv_obj_set_style_shadow_width(btn, 10, 0);
-    lv_obj_set_style_shadow_opa(btn, LV_OPA_30, 0);
-    lv_obj_set_style_shadow_ofs_y(btn, 5, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_set_style_shadow_opa(btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_shadow_ofs_y(btn, 0, 0);
     lv_obj_set_style_bg_color(btn, lv_color_darken(bg_color, 30), LV_STATE_PRESSED);
 
     // 创建温度计图标容器
@@ -353,8 +409,16 @@ void ui_home_create(void)
     lv_obj_align(wifi_status_label, LV_ALIGN_TOP_RIGHT, -5, 12);
     lv_obj_add_flag(wifi_status_label, LV_OBJ_FLAG_HIDDEN);  // 初始隐藏
 
+    developer_status_label = lv_label_create(screen_home);
+    lv_label_set_text(developer_status_label, LV_SYMBOL_SETTINGS);
+    lv_obj_set_style_text_font(developer_status_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(developer_status_label, lv_color_hex(0xFF9800), 0);
+    lv_obj_align(developer_status_label, LV_ALIGN_TOP_RIGHT, -27, 12);
+    lv_obj_add_flag(developer_status_label, LV_OBJ_FLAG_HIDDEN);
+
     // Register WiFi status label with main app
     app_main_set_wifi_status_label(wifi_status_label);
+    ui_home_refresh_developer_status();
 
     // 创建四个按钮 (90x90, col1=20, col2=130, row1=50, row2=180)
     // Camera - 使用VIDEO符号(录像机样式)
@@ -365,9 +429,9 @@ void ui_home_create(void)
     btn_temp = create_temp_btn(screen_home, "Temp", 1, 0, lv_color_hex(0x00BCD4));
     lv_obj_add_event_cb(btn_temp, btn_temp_callback, LV_EVENT_ALL, NULL);
 
-    // XiaoZhi - AI文字图标
-    btn_xiaozhi = create_menu_btn(screen_home, "AI", "XiaoZhi", 0, 1, lv_color_hex(0x9C27B0));
-    lv_obj_add_event_cb(btn_xiaozhi, btn_xiaozhi_callback, LV_EVENT_ALL, NULL);
+    // History - 历史记录入口
+    btn_history = create_menu_btn(screen_home, LV_SYMBOL_LIST, "History", 0, 1, lv_color_hex(0x5E35B1));
+    lv_obj_add_event_cb(btn_history, btn_history_callback, LV_EVENT_ALL, NULL);
 
     // Setup - 齿轮图标 (灰色)
     btn_settings = create_menu_btn(screen_home, LV_SYMBOL_SETTINGS, "Setup", 1, 1, lv_color_hex(0x78909C));
@@ -394,5 +458,16 @@ void ui_home_set_wifi_status(bool connected)
         // 未连接 - 显示WiFi图标带X
         lv_label_set_text(wifi_status_label, LV_SYMBOL_CLOSE);
         lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0x9E9E9E), 0);  // 灰色表示未连接
+    }
+}
+
+void ui_home_refresh_developer_status(void)
+{
+    if(developer_status_label == NULL) return;
+
+    if(developer_mode_any_enabled()) {
+        lv_obj_clear_flag(developer_status_label, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(developer_status_label, LV_OBJ_FLAG_HIDDEN);
     }
 }

@@ -26,6 +26,10 @@ typedef enum {
     STATE_POS_FAILED,     // 检测超时失败 (Pos Failed)
     STATE_LIMIT_FAILED,   // 滑块极限失败 (Max H)
     STATE_CAPTURING,      // 三区域拍摄中 (Zone X...)
+    STATE_UPLOAD_READY,   // 拍摄完成，等待用户上传
+    STATE_UPLOADING,      // 正在上传混元3D
+    STATE_UPLOAD_FAILED,  // 上传或生成失败
+    STATE_MODEL_DONE,     // 模型生成完成
 } camera_state_t;
 
 /**

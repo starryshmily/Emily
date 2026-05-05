@@ -75,6 +75,9 @@ void k230_client_disconnect(void);
  * @return ESP_OK on success
  */
 esp_err_t k230_client_start_scan(void);
+esp_err_t k230_client_start_upload(void);
+esp_err_t k230_client_start_upload_test(void);
+esp_err_t k230_client_get_preview_image(int zone, int offset_y, uint8_t **data, size_t *len);
 
 /**
  * @brief 获取当前连接状态

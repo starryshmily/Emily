@@ -26,6 +26,27 @@ static lv_obj_t *label_humi = NULL;
 extern float temp;
 extern float humi;
 
+void ui_temp_destroy(void)
+{
+    if(temp_timer) {
+        lv_timer_del(temp_timer);
+        temp_timer = NULL;
+    }
+
+    lv_obj_t *old_screen = screen_temp;
+    screen_temp = NULL;
+    meter_temp = NULL;
+    indic_needle_temp = NULL;
+    label_temp = NULL;
+    meter_humi = NULL;
+    indic_needle_humi = NULL;
+    label_humi = NULL;
+
+    if(old_screen) {
+        lv_obj_del_async(old_screen);
+    }
+}
+
 static void temp_read_timer_cb(lv_timer_t *t)
 {
     // 读取GXHTC3传感器数据
@@ -74,11 +95,8 @@ static void btn_back_callback(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
     if(code == LV_EVENT_CLICKED) {
-        if(temp_timer) {
-            lv_timer_del(temp_timer);
-            temp_timer = NULL;
-        }
         lv_scr_load(ui_home_get_screen());
+        ui_temp_destroy();
     }
 }
 
@@ -86,17 +104,7 @@ static void btn_back_callback(lv_event_t *e)
 static void ui_temp_create_internal(float initial_temp, float initial_humi)
 {
     // 删除旧的screen（如果存在），防止内存泄漏
-    if(screen_temp != NULL) {
-        lv_obj_del(screen_temp);
-        screen_temp = NULL;
-        meter_temp = NULL;
-        indic_needle_temp = NULL;
-        label_temp = NULL;
-        meter_humi = NULL;
-        indic_needle_humi = NULL;
-        label_humi = NULL;
-        temp_timer = NULL;
-    }
+    ui_temp_destroy();
 
     screen_temp = lv_obj_create(NULL);
     // 增加高度以支持滚动 - 320 -> 640

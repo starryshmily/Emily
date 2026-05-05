@@ -183,6 +183,63 @@ static esp_err_t http_start_scan(void)
     return err;
 }
 
+static esp_err_t http_start_upload(void)
+{
+    char url[128];
+    snprintf(url, sizeof(url), "http://%s:%d/api/upload", g_config.host, g_config.http_port);
+
+    esp_http_client_config_t http_cfg = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 15000,
+        .buffer_size = 1024,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
+    if (!client) {
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = esp_http_client_perform(client);
+    esp_http_client_cleanup(client);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Upload command sent");
+    } else {
+        ESP_LOGE(TAG, "Upload request failed: %s", esp_err_to_name(err));
+    }
+
+    return err;
+}
+
+static esp_err_t http_start_upload_test(void)
+{
+    char url[128];
+    snprintf(url, sizeof(url), "http://%s:%d/api/upload_test", g_config.host, g_config.http_port);
+
+    esp_http_client_config_t http_cfg = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 10000,
+        .buffer_size = 1024,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
+    if (!client) {
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = esp_http_client_perform(client);
+    esp_http_client_cleanup(client);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Upload test command sent");
+    } else {
+        ESP_LOGE(TAG, "Upload test request failed: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
 // ============== MJPEG视频流接收 ==============
 
 /**
@@ -629,6 +686,112 @@ esp_err_t k230_client_start_scan(void)
     return err;
 }
 
+esp_err_t k230_client_start_upload(void)
+{
+    if (!g_is_connected) {
+        ESP_LOGE(TAG, "Not connected to K230");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (g_stream_running) {
+        ESP_LOGI(TAG, "Pausing stream for UPLOAD request");
+        g_stream_running = false;
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+
+    esp_err_t err = http_start_upload();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Upload request failed, retrying in 500ms...");
+        vTaskDelay(pdMS_TO_TICKS(500));
+        err = http_start_upload();
+    }
+
+    return err;
+}
+
+esp_err_t k230_client_start_upload_test(void)
+{
+    if (!g_is_connected) {
+        ESP_LOGE(TAG, "Not connected to K230");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (g_stream_running) {
+        g_stream_running = false;
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+
+    return http_start_upload_test();
+}
+
+esp_err_t k230_client_get_preview_image(int zone, int offset_y, uint8_t **data, size_t *len)
+{
+    if (!data || !len || zone < 1 || zone > 3) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *data = NULL;
+    *len = 0;
+
+    char url[160];
+    snprintf(url, sizeof(url), "http://%s:%d/api/preview?zone=%d&offset=%d",
+             g_config.host, g_config.http_port, zone, offset_y);
+
+    esp_http_client_config_t http_cfg = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = 10000,
+        .buffer_size = 2048,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
+    if (!client) {
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        esp_http_client_cleanup(client);
+        return err;
+    }
+
+    int content_len = esp_http_client_fetch_headers(client);
+    if (content_len <= 0 || content_len > 120 * 1024) {
+        ESP_LOGW(TAG, "Preview image unsupported size: %d", content_len);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_FAIL;
+    }
+
+    uint8_t *buf = malloc(content_len);
+    if (!buf) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_ERR_NO_MEM;
+    }
+
+    int total = 0;
+    while (total < content_len) {
+        int read_len = esp_http_client_read(client, (char *)buf + total, content_len - total);
+        if (read_len <= 0) {
+            break;
+        }
+        total += read_len;
+    }
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (total != content_len) {
+        free(buf);
+        ESP_LOGW(TAG, "Preview read incomplete: %d/%d", total, content_len);
+        return ESP_FAIL;
+    }
+
+    *data = buf;
+    *len = (size_t)total;
+    return ESP_OK;
+}
+
 bool k230_client_is_connected(void)
 {
     return g_is_connected;
@@ -720,5 +883,3 @@ void k230_client_stop_stream(void)
     g_stream_running = false;
     g_is_connected = false;  // 让 recv() 立即返回
 }
-
-

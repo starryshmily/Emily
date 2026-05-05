@@ -10,5 +10,6 @@
 void ui_temp_create(void);
 void ui_temp_create_with_temp(float initial_temp);
 void ui_temp_set_value(float temp);
+void ui_temp_destroy(void);
 
 #endif // UI_TEMP_H

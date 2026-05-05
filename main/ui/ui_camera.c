@@ -14,6 +14,8 @@
 #include "camera_client.h"
 #include "jpeg_decoder.h"
 #include "c3_uart.h"
+#include "history_store.h"
+#include "developer_mode.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_timer.h"
@@ -73,6 +75,12 @@ static lv_obj_t *btn_down = NULL;
 static lv_obj_t *btn_zero = NULL;  // Zero归零按钮
 static lv_obj_t *btn_calibrate = NULL;  // 校准按钮
 static lv_obj_t *label_calibrate = NULL; // 校准按钮文字
+static lv_obj_t *preview_touch_area = NULL;
+static lv_obj_t *label_pic_zone = NULL;
+static lv_obj_t *upload_panel = NULL;
+static lv_obj_t *upload_arc = NULL;
+static lv_obj_t *upload_percent_label = NULL;
+static lv_obj_t *upload_stage_label = NULL;
 
 // Video buffer - 静态分配
 static uint8_t video_buffer[VIDEO_W * VIDEO_H * 2];
@@ -87,6 +95,8 @@ static bool first_frame_received = false;
 // K230 client state
 static bool k230_connected = false;
 static TaskHandle_t k230_connect_task_handle = NULL;
+static volatile uint32_t camera_session_id = 0;
+static volatile bool camera_page_active = false;
 
 // 状态机
 static camera_state_t current_state = STATE_CONNECTING;
@@ -108,6 +118,10 @@ static volatile int64_t last_move_send_time_ms = 0; // 上次发送UP/DOWN的时
 #define MIN_MOVE_INTERVAL_MS 1500  // 两次UP/DOWN最短间隔(ms)，防止触摸抖动双发
 static volatile bool capture_cancelled = false;    // Cancel during CAPTURING, ignore late ALL_DONE
 static volatile bool pending_cancel_capture = false; // Cancel during CAPTURING motor move, wait for HEIGHT then STOP
+static volatile bool preview_mode = false;
+static volatile int preview_zone = 1;
+static volatile int preview_offset_y = 0;
+static TaskHandle_t preview_task_handle = NULL;
 static float height_before_calib = 0.0f;  // 校准前的高度（用于校准模式取消）
 
 // K230断开检测
@@ -132,6 +146,23 @@ static void switch_state(camera_state_t new_state);
 static void handle_k230_disconnect(const char *reason);
 static void start_delayed_disconnect(void);  // 延迟断开（后台保活）
 bool ui_camera_is_in_background(void);  // 后台保活模式检查
+static void request_preview_load(void);
+static void cleanup_camera_page_resources(void);
+static void show_upload_progress(bool show);
+static void set_upload_progress_animated(int percent, const char *stage);
+
+static bool camera_session_is_valid(uint32_t task_session)
+{
+    return camera_page_active && camera_session_id == task_session;
+}
+
+static void finish_k230_connect_task(uint32_t task_session)
+{
+    if (camera_session_id == task_session) {
+        k230_connect_task_handle = NULL;
+    }
+    vTaskDelete(NULL);
+}
 
 // ============== 按钮样式辅助函数 ==============
 
@@ -271,6 +302,193 @@ static void request_label_update(const char *text)
     has_pending_label = true;
 }
 
+static void update_pic_zone_label(void)
+{
+    if (!label_pic_zone) return;
+    lv_label_set_text_fmt(label_pic_zone, "Pic Z%d", preview_zone);
+}
+
+static void preview_load_task(void *arg)
+{
+    int zone = preview_zone;
+    int offset = preview_offset_y;
+    uint8_t *jpeg_data = NULL;
+    size_t jpeg_len = 0;
+
+    esp_err_t err = k230_client_get_preview_image(zone, offset, &jpeg_data, &jpeg_len);
+    if (err == ESP_OK && jpeg_data && jpeg_len > 0) {
+        if (xSemaphoreTake(video_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            jpeg_decode_config_t cfg = {
+                .output_buffer = video_buffer,
+                .output_size = VIDEO_W * VIDEO_H * 2,
+                .output_width = 256,
+                .output_height = 144,
+                .rotate_90 = true,
+            };
+
+            if (jpeg_decode_to_rgb565(jpeg_data, jpeg_len, &cfg) == ESP_OK) {
+                if (xSemaphoreTakeRecursive(lcd_draw_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    app_lcd_draw_bitmap(
+                        VIDEO_POS_X, VIDEO_POS_Y,
+                        VIDEO_POS_X + VIDEO_W, VIDEO_POS_Y + VIDEO_H,
+                        video_buffer
+                    );
+                    xSemaphoreGiveRecursive(lcd_draw_mutex);
+                }
+            } else {
+                ESP_LOGW(TAG, "Preview decode failed: zone=%d len=%u", zone, (unsigned)jpeg_len);
+            }
+            xSemaphoreGive(video_mutex);
+        }
+    } else {
+        ESP_LOGW(TAG, "Preview load failed: zone=%d offset=%d err=%s", zone, offset, esp_err_to_name(err));
+    }
+
+    if (jpeg_data) {
+        free(jpeg_data);
+    }
+    preview_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void request_preview_load(void)
+{
+    if (!preview_mode || preview_task_handle) {
+        return;
+    }
+    xTaskCreate(preview_load_task, "preview_img", 4096, NULL, 4, &preview_task_handle);
+}
+
+static void preview_gesture_callback(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_GESTURE || !preview_mode) {
+        return;
+    }
+
+    lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_get_act());
+    if (dir == LV_DIR_LEFT) {
+        preview_zone++;
+        if (preview_zone > 3) preview_zone = 1;
+        preview_offset_y = 0;
+    } else if (dir == LV_DIR_RIGHT) {
+        preview_zone--;
+        if (preview_zone < 1) preview_zone = 3;
+        preview_offset_y = 0;
+    } else if (dir == LV_DIR_TOP) {
+        preview_offset_y += 120;
+    } else if (dir == LV_DIR_BOTTOM) {
+        preview_offset_y -= 120;
+        if (preview_offset_y < 0) preview_offset_y = 0;
+    } else {
+        return;
+    }
+
+    update_pic_zone_label();
+    request_preview_load();
+}
+
+static void log_upload_ready_paths(const char *clean)
+{
+    char payload[384];
+    snprintf(payload, sizeof(payload), "%s", clean + 13);
+
+    char *fields[6] = {0};
+    char *p = payload;
+    for (int i = 0; i < 6 && p; i++) {
+        fields[i] = p;
+        char *sep = strchr(p, '|');
+        if (sep) {
+            *sep = '\0';
+            p = sep + 1;
+        } else {
+            p = NULL;
+        }
+    }
+
+    ESP_LOGI(TAG, "Upload ready scan: %s", fields[0] ? fields[0] : "N/A");
+    ESP_LOGI(TAG, "Upload photo Z1: %s", fields[1] ? fields[1] : "N/A");
+    ESP_LOGI(TAG, "Upload photo Z2: %s", fields[2] ? fields[2] : "N/A");
+    ESP_LOGI(TAG, "Upload photo Z3: %s", fields[3] ? fields[3] : "N/A");
+    ESP_LOGI(TAG, "Upload photo Bottom: %s", fields[4] ? fields[4] : "N/A");
+    ESP_LOGI(TAG, "Model output dir: %s", fields[5] ? fields[5] : "N/A");
+}
+
+static void log_model_done_fields(char **fields)
+{
+    ESP_LOGI(TAG, "Model generated name: %s", fields[0] ? fields[0] : "N/A");
+    ESP_LOGI(TAG, "Model generated time: %s", fields[1] ? fields[1] : "N/A");
+    ESP_LOGI(TAG, "Model file size: %s", fields[2] ? fields[2] : "N/A");
+    ESP_LOGI(TAG, "Pointcloud file size: %s", fields[3] ? fields[3] : "N/A");
+    ESP_LOGI(TAG, "Model output dir: %s", fields[4] ? fields[4] : "N/A");
+}
+
+static void upload_arc_anim_cb(void *obj, int32_t value)
+{
+    lv_arc_set_value((lv_obj_t *)obj, value);
+    if (upload_percent_label) {
+        lv_label_set_text_fmt(upload_percent_label, "%d%%", (int)value);
+    }
+}
+
+static void show_upload_progress(bool show)
+{
+    if (!upload_panel || !upload_arc || !upload_percent_label || !upload_stage_label) {
+        return;
+    }
+
+    if (show) {
+        lv_obj_clear_flag(upload_panel, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(upload_arc, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(upload_percent_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(upload_stage_label, LV_OBJ_FLAG_HIDDEN);
+        if (preview_touch_area) lv_obj_add_flag(preview_touch_area, LV_OBJ_FLAG_HIDDEN);
+        if (label_pic_zone) lv_obj_add_flag(label_pic_zone, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(upload_panel, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(upload_arc, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(upload_percent_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(upload_stage_label, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void set_upload_progress_animated(int percent, const char *stage)
+{
+    if (!upload_arc) {
+        return;
+    }
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+
+    show_upload_progress(true);
+    if (upload_stage_label && stage) {
+        lv_label_set_text(upload_stage_label, stage);
+    }
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, upload_arc);
+    lv_anim_set_values(&a, lv_arc_get_value(upload_arc), percent);
+    lv_anim_set_time(&a, 350);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_set_exec_cb(&a, upload_arc_anim_cb);
+    lv_anim_start(&a);
+}
+
+static void handle_model_progress(const char *clean)
+{
+    char payload[96];
+    snprintf(payload, sizeof(payload), "%s", clean + 15);
+    char *sep = strchr(payload, '|');
+    if (!sep) {
+        return;
+    }
+    *sep = '\0';
+    int percent = atoi(payload);
+    const char *stage = sep + 1;
+    ESP_LOGI(TAG, "Model progress: %d%% %s", percent, stage);
+    set_upload_progress_animated(percent, stage);
+}
+
 // ============== K230断开处理 ==============
 
 static void handle_k230_disconnect(const char *reason)
@@ -292,6 +510,90 @@ static void handle_k230_disconnect(const char *reason)
 }
 
 // ============== 状态切换函数 ==============
+
+static void cleanup_camera_page_resources(void)
+{
+    ESP_LOGI(TAG, "Cleaning up camera page resources");
+
+    k230_connected = false;
+    bg_keepalive_mode = false;
+    uart_rx_running = false;
+    preview_mode = false;
+    preview_task_handle = NULL;
+    k230_connect_task_handle = NULL;
+    uart_rx_task_handle = NULL;
+
+    if (detect_timer) {
+        esp_timer_stop(detect_timer);
+        esp_timer_delete(detect_timer);
+        detect_timer = NULL;
+    }
+    if (force_stop_timer) {
+        esp_timer_stop(force_stop_timer);
+        esp_timer_delete(force_stop_timer);
+        force_stop_timer = NULL;
+    }
+    if (slider_move_timer) {
+        esp_timer_stop(slider_move_timer);
+        esp_timer_delete(slider_move_timer);
+        slider_move_timer = NULL;
+    }
+    if (delayed_disconnect_timer) {
+        esp_timer_stop(delayed_disconnect_timer);
+        esp_timer_delete(delayed_disconnect_timer);
+        delayed_disconnect_timer = NULL;
+    }
+    if (deferred_timer) {
+        lv_timer_del(deferred_timer);
+        deferred_timer = NULL;
+    }
+
+    k230_client_set_frame_callback(NULL);
+    k230_client_force_stop_stream();
+
+    if (video_mutex) {
+        vSemaphoreDelete(video_mutex);
+        video_mutex = NULL;
+    }
+    if (lcd_draw_mutex) {
+        vSemaphoreDelete(lcd_draw_mutex);
+        lcd_draw_mutex = NULL;
+    }
+
+    if (screen_camera) {
+        lv_obj_del(screen_camera);
+        screen_camera = NULL;
+    }
+
+    label_status = NULL;
+    label_height = NULL;
+    btn_back = NULL;
+    btn_start = NULL;
+    label_start = NULL;
+    btn_cancel = NULL;
+    btn_up = NULL;
+    btn_down = NULL;
+    btn_zero = NULL;
+    btn_calibrate = NULL;
+    label_calibrate = NULL;
+    preview_touch_area = NULL;
+    label_pic_zone = NULL;
+    upload_panel = NULL;
+    upload_arc = NULL;
+    upload_percent_label = NULL;
+    upload_stage_label = NULL;
+
+    slider_height_mm = 0;
+    slider_moving = false;
+    cmd_send_lock = false;
+    pending_move_direction = 0;
+    pending_cancel_capture = false;
+    capture_cancelled = false;
+    has_pending_state = false;
+    has_pending_ui_update = false;
+    has_pending_label = false;
+    current_state = STATE_CONNECTING;
+}
 
 static void switch_state(camera_state_t new_state)
 {
@@ -327,6 +629,9 @@ static void switch_state(camera_state_t new_state)
         break;
 
     case STATE_IDLE:
+        preview_mode = false;
+        if (preview_touch_area) lv_obj_add_flag(preview_touch_area, LV_OBJ_FLAG_HIDDEN);
+        if (label_pic_zone) lv_obj_add_flag(label_pic_zone, LV_OBJ_FLAG_HIDDEN);
         label_status ? lv_label_set_text(label_status, "Ready") : (void)0;
         lv_label_set_text(label_start, "Start");
         set_btn_style(btn_start, COLOR_GREEN, true);
@@ -416,7 +721,67 @@ static void switch_state(camera_state_t new_state)
         break;
 
     case STATE_CAPTURING:
+        preview_mode = false;
+        if (preview_touch_area) lv_obj_add_flag(preview_touch_area, LV_OBJ_FLAG_HIDDEN);
+        if (label_pic_zone) lv_obj_add_flag(label_pic_zone, LV_OBJ_FLAG_HIDDEN);
         label_status ? lv_label_set_text(label_status, "Zone 1...") : (void)0;
+        set_btn_disabled(btn_start, COLOR_GRAY);
+        set_btn_disabled(btn_up, COLOR_GRAY);
+        set_btn_disabled(btn_down, COLOR_GRAY);
+        set_btn_disabled(btn_zero, COLOR_GRAY);
+        set_btn_style(btn_cancel, COLOR_RED, true);
+        if (btn_calibrate) lv_obj_add_flag(btn_calibrate, LV_OBJ_FLAG_HIDDEN);
+        break;
+
+    case STATE_UPLOAD_READY:
+        show_upload_progress(false);
+        preview_mode = true;
+        preview_zone = 1;
+        preview_offset_y = 0;
+        label_status ? lv_label_set_text(label_status, "Upload") : (void)0;
+        lv_label_set_text(label_start, "Upload");
+        set_btn_style(btn_start, COLOR_GREEN, true);
+        set_btn_disabled(btn_up, COLOR_GRAY);
+        set_btn_disabled(btn_down, COLOR_GRAY);
+        set_btn_disabled(btn_zero, COLOR_GRAY);
+        set_btn_style(btn_cancel, COLOR_RED, true);
+        if (btn_calibrate) lv_obj_add_flag(btn_calibrate, LV_OBJ_FLAG_HIDDEN);
+        if (preview_touch_area) lv_obj_clear_flag(preview_touch_area, LV_OBJ_FLAG_HIDDEN);
+        if (label_pic_zone) {
+            lv_obj_clear_flag(label_pic_zone, LV_OBJ_FLAG_HIDDEN);
+            update_pic_zone_label();
+        }
+        request_preview_load();
+        break;
+
+    case STATE_UPLOADING:
+        preview_mode = false;
+        set_upload_progress_animated(5, "Preparing");
+        label_status ? lv_label_set_text(label_status, "Uploading") : (void)0;
+        lv_label_set_text(label_start, "Wait");
+        set_btn_disabled(btn_start, COLOR_GRAY);
+        set_btn_disabled(btn_up, COLOR_GRAY);
+        set_btn_disabled(btn_down, COLOR_GRAY);
+        set_btn_disabled(btn_zero, COLOR_GRAY);
+        set_btn_style(btn_cancel, COLOR_RED, true);
+        if (btn_calibrate) lv_obj_add_flag(btn_calibrate, LV_OBJ_FLAG_HIDDEN);
+        break;
+
+    case STATE_UPLOAD_FAILED:
+        label_status ? lv_label_set_text(label_status, "Upload Fail") : (void)0;
+        lv_label_set_text(label_start, "Upload");
+        set_btn_style(btn_start, COLOR_ORANGE, true);
+        set_btn_disabled(btn_up, COLOR_GRAY);
+        set_btn_disabled(btn_down, COLOR_GRAY);
+        set_btn_disabled(btn_zero, COLOR_GRAY);
+        set_btn_style(btn_cancel, COLOR_RED, true);
+        if (btn_calibrate) lv_obj_add_flag(btn_calibrate, LV_OBJ_FLAG_HIDDEN);
+        break;
+
+    case STATE_MODEL_DONE:
+        set_upload_progress_animated(100, "Done");
+        label_status ? lv_label_set_text(label_status, "Done") : (void)0;
+        lv_label_set_text(label_start, "Done");
         set_btn_disabled(btn_start, COLOR_GRAY);
         set_btn_disabled(btn_up, COLOR_GRAY);
         set_btn_disabled(btn_down, COLOR_GRAY);
@@ -601,6 +966,30 @@ static void process_uart_message(const char *clean)
                 ESP_LOGI(TAG, "Capture: %s", zone_text);
             }
         }
+    } else if (strncmp(clean, "UPLOAD_READY|", 13) == 0) {
+        ui_camera_heartbeat();
+        log_upload_ready_paths(clean);
+        pending_cancel_capture = false;
+        capture_cancelled = false;
+        request_label_update("Upload");
+        request_state_change(STATE_UPLOAD_READY);
+    } else if (strncmp(clean, "UPLOAD_READY", 12) == 0) {
+        ui_camera_heartbeat();
+        pending_cancel_capture = false;
+        capture_cancelled = false;
+        request_label_update("Upload");
+        request_state_change(STATE_UPLOAD_READY);
+    } else if (strncmp(clean, "MODEL_PROGRESS|", 15) == 0) {
+        ui_camera_heartbeat();
+        handle_model_progress(clean);
+        request_state_change(STATE_UPLOADING);
+    } else if (strcmp(clean, "MODEL_UPLOAD") == 0 || strcmp(clean, "MODEL_WAIT") == 0) {
+        ui_camera_heartbeat();
+        request_state_change(STATE_UPLOADING);
+    } else if (strncmp(clean, "MODEL_ERROR", 11) == 0) {
+        ui_camera_heartbeat();
+        request_label_update("Upload Fail");
+        request_state_change(STATE_UPLOAD_FAILED);
     } else if (strcmp(clean, "ALL_DONE") == 0 || strcmp(clean, "CANCELLED") == 0) {
         ui_camera_heartbeat();
         pending_cancel_capture = false;  // 无论什么情况，清除等待标志
@@ -617,10 +1006,68 @@ static void process_uart_message(const char *clean)
             request_ui_update();
             request_state_change(STATE_IDLE);
         } else {
-            ESP_LOGI(TAG, "All zones captured, back to POS_SUCCESS");
-            request_label_update("Scan Done");
-            request_state_change(STATE_POS_SUCCESS);
+            ESP_LOGI(TAG, "All zones captured, switching to UPLOAD_READY");
+            request_label_update("Upload");
+            request_state_change(STATE_UPLOAD_READY);
         }
+    } else if (strncmp(clean, "MODEL_DONE|", 11) == 0) {
+        char payload[192];
+        snprintf(payload, sizeof(payload), "%s", clean + 11);
+        char *fields[5] = {0};
+        char *p = payload;
+        for (int i = 0; i < 5 && p; i++) {
+            fields[i] = p;
+            char *sep = strchr(p, '|');
+            if (sep) {
+                *sep = '\0';
+                p = sep + 1;
+            } else {
+                p = NULL;
+            }
+        }
+
+        if (fields[0] && fields[1]) {
+            log_model_done_fields(fields);
+            esp_err_t err = history_store_add_full(fields[0],
+                                                   fields[1],
+                                                   fields[2] ? fields[2] : "N/A",
+                                                   fields[3] ? fields[3] : "N/A",
+                                                   fields[4] ? fields[4] : "N/A");
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "Model history saved: %s / %s", fields[0], fields[1]);
+            } else {
+                ESP_LOGE(TAG, "Model history save failed: %s", esp_err_to_name(err));
+            }
+            set_upload_progress_animated(100, "Done");
+            request_state_change(STATE_IDLE);
+        } else {
+            ESP_LOGW(TAG, "Invalid MODEL_DONE message: %s", clean);
+        }
+    } else if (strncmp(clean, "MODEL_DONE:", 11) == 0) {
+        const char *payload = clean + 11;
+        const char *sep = strchr(payload, ':');
+        if (sep && sep > payload && *(sep + 1) != '\0') {
+            char model_name[HISTORY_MODEL_NAME_LEN];
+            char created_time[HISTORY_CREATED_TIME_LEN];
+            size_t name_len = sep - payload;
+            if (name_len >= sizeof(model_name)) {
+                name_len = sizeof(model_name) - 1;
+            }
+            memcpy(model_name, payload, name_len);
+            model_name[name_len] = '\0';
+            snprintf(created_time, sizeof(created_time), "%s", sep + 1);
+
+            esp_err_t err = history_store_add(model_name, created_time);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "Model history saved: %s / %s", model_name, created_time);
+            } else {
+                ESP_LOGE(TAG, "Model history save failed: %s", esp_err_to_name(err));
+            }
+        } else {
+            ESP_LOGW(TAG, "Invalid MODEL_DONE message: %s", clean);
+        }
+        set_upload_progress_animated(100, "Done");
+        request_state_change(STATE_IDLE);
     }
 }
 
@@ -690,7 +1137,11 @@ static void uart_rx_task(void *arg)
             current_state != STATE_POS_SUCCESS &&
             current_state != STATE_LIMIT_FAILED &&
             current_state != STATE_POS_FAILED &&
-            current_state != STATE_CAPTURING) {
+            current_state != STATE_CAPTURING &&
+            current_state != STATE_UPLOAD_READY &&
+            current_state != STATE_UPLOADING &&
+            current_state != STATE_UPLOAD_FAILED &&
+            current_state != STATE_MODEL_DONE) {
             int64_t now = esp_timer_get_time() / 1000;
             if (last_frame_time_ms > 0 && (now - last_frame_time_ms) > STREAM_TIMEOUT_MS) {
                 handle_k230_disconnect("stream timeout");
@@ -709,6 +1160,7 @@ static void uart_rx_task(void *arg)
 
 static void k230_connect_task(void *arg)
 {
+    uint32_t task_session = camera_session_id;
     ESP_LOGI(TAG, "Starting K230 connection...");
 
     k230_client_config_t k230_config = {
@@ -720,21 +1172,36 @@ static void k230_connect_task(void *arg)
     esp_err_t err = k230_client_init(&k230_config, progress_callback);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "K230 init failed: %s", esp_err_to_name(err));
-        request_state_change(STATE_CONN_FAILED);
-        k230_connect_task_handle = NULL;
-        vTaskDelete(NULL);
+        if (camera_session_is_valid(task_session)) {
+            request_state_change(STATE_CONN_FAILED);
+        }
+        finish_k230_connect_task(task_session);
         return;
     }
 
     k230_client_set_frame_callback(video_frame_callback);
     vTaskDelay(pdMS_TO_TICKS(100));
+    if (!camera_session_is_valid(task_session)) {
+        ESP_LOGI(TAG, "K230 connect task ignored: stale session before connect");
+        finish_k230_connect_task(task_session);
+        return;
+    }
 
     err = k230_client_connect();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Connection failed: %s", esp_err_to_name(err));
-        request_state_change(STATE_CONN_FAILED);
-        k230_connect_task_handle = NULL;
-        vTaskDelete(NULL);
+        if (camera_session_is_valid(task_session)) {
+            request_state_change(STATE_CONN_FAILED);
+        } else {
+            ESP_LOGI(TAG, "K230 connect failure ignored: stale session");
+        }
+        finish_k230_connect_task(task_session);
+        return;
+    }
+    if (!camera_session_is_valid(task_session)) {
+        ESP_LOGI(TAG, "K230 connect success ignored: stale session");
+        k230_client_force_stop_stream();
+        finish_k230_connect_task(task_session);
         return;
     }
 
@@ -755,6 +1222,31 @@ static void k230_connect_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // 启动视频流 (不修改原有视频流逻辑)
+    if (!camera_session_is_valid(task_session)) {
+        ESP_LOGI(TAG, "K230 connect task ignored: stale session before stream");
+        finish_k230_connect_task(task_session);
+        return;
+    }
+
+    if (developer_mode_is_upload_test()) {
+        ESP_LOGI(TAG, "Developer Upload Test enabled: request K230 test pictures");
+        err = k230_client_start_upload_test();
+        if (err == ESP_OK) {
+            if (camera_session_is_valid(task_session)) {
+                first_frame_received = true;
+                request_label_update("Upload");
+                request_state_change(STATE_UPLOAD_READY);
+            }
+        } else {
+            ESP_LOGE(TAG, "Upload Test request failed: %s", esp_err_to_name(err));
+            if (camera_session_is_valid(task_session)) {
+                request_state_change(STATE_CONN_FAILED);
+            }
+        }
+        finish_k230_connect_task(task_session);
+        return;
+    }
+
     err = k230_client_start_stream();
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "Stream started");
@@ -762,8 +1254,7 @@ static void k230_connect_task(void *arg)
         ESP_LOGE(TAG, "Stream failed: %s", esp_err_to_name(err));
     }
 
-    k230_connect_task_handle = NULL;
-    vTaskDelete(NULL);
+    finish_k230_connect_task(task_session);
 }
 
 // ============== Video frame callback (不修改视频流解码逻辑) ==============
@@ -780,6 +1271,10 @@ static void video_frame_callback(const uint8_t *jpeg_data, size_t jpeg_len)
         first_frame_received = true;
         ESP_LOGI(TAG, "First frame received, switching to IDLE");
         request_state_change(STATE_IDLE);
+    }
+
+    if (preview_mode) {
+        return;
     }
 
     if (xSemaphoreTake(video_mutex, pdMS_TO_TICKS(5)) != pdTRUE) {
@@ -843,7 +1338,12 @@ static void btn_back_callback(lv_event_t *e)
         }
 
         // 未连接或正在连接中，立即断开（不需要保活）
-        ESP_LOGI(TAG, "Back clicked: immediate disconnect (not in stream mode)");
+        ESP_LOGI(TAG, "Back clicked: immediate cleanup (not in stream mode)");
+        camera_page_active = false;
+        camera_session_id++;
+        lv_scr_load(ui_home_get_screen());
+        cleanup_camera_page_resources();
+        return;
 
         // 立即标记断开 (防止断开处理函数触发)
         k230_connected = false;
@@ -909,6 +1409,12 @@ static void btn_start_callback(lv_event_t *e)
         capture_cancelled = false;  // 重置取消标志，开始新的扫描
         pending_cancel_capture = false;
         k230_client_start_scan();
+    } else if (current_state == STATE_UPLOAD_READY || current_state == STATE_UPLOAD_FAILED) {
+        ESP_LOGI(TAG, "Upload: sending UPLOAD to K230");
+        switch_state(STATE_UPLOADING);
+        if (k230_client_start_upload() != ESP_OK) {
+            switch_state(STATE_UPLOAD_FAILED);
+        }
     } else if (current_state == STATE_CONN_FAILED) {
         ESP_LOGI(TAG, "Reconnect: restarting connection to K230");
         first_frame_received = false;  // 重置首帧标志，允许新连接触发IDLE切换
@@ -954,6 +1460,18 @@ static void btn_cancel_callback(lv_event_t *e)
         update_up_down_buttons();
         if (slider_move_timer) esp_timer_start_once(slider_move_timer, 25000000);  // 25s for HOME
                 c3_uart_send("HOME");
+        switch_state(STATE_IDLE);
+    } else if (current_state == STATE_UPLOAD_READY || current_state == STATE_UPLOADING ||
+               current_state == STATE_UPLOAD_FAILED || current_state == STATE_MODEL_DONE) {
+        ESP_LOGI(TAG, "Cancel upload/model state: sending HOME and returning IDLE");
+        preview_mode = false;
+        if (preview_touch_area) lv_obj_add_flag(preview_touch_area, LV_OBJ_FLAG_HIDDEN);
+        if (label_pic_zone) lv_obj_add_flag(label_pic_zone, LV_OBJ_FLAG_HIDDEN);
+        slider_moving = true;
+        pending_move_direction = -1;
+        update_up_down_buttons();
+        if (slider_move_timer) esp_timer_start_once(slider_move_timer, 25000000);
+        c3_uart_send("HOME");
         switch_state(STATE_IDLE);
     } else if (current_state == STATE_CAPTURING) {
         // 拍摄中取消: 不立即发STOP，等当前移动完成(HEIGHT消息)后再发
@@ -1095,6 +1613,7 @@ void ui_camera_create(void)
     // 注意：必须在删除旧屏幕之前检查，否则会丢失screen_camera引用
     if (ui_camera_is_in_background()) {
         ESP_LOGI(TAG, "Resuming from background keepalive mode...");
+        camera_page_active = true;
 
         // 先停止延迟断开定时器
         if (delayed_disconnect_timer) {
@@ -1123,6 +1642,9 @@ void ui_camera_create(void)
         // 正常流程：清理旧屏幕
         if (screen_camera) lv_obj_del(screen_camera);
     }
+
+    camera_page_active = true;
+    camera_session_id++;
 
     screen_camera = lv_obj_create(NULL);
     lv_obj_set_size(screen_camera, 240, 320);
@@ -1321,6 +1843,72 @@ void ui_camera_create(void)
     lv_obj_set_style_text_color(label_status, lv_color_hex(0xAAAAAA), 0);
     lv_obj_set_pos(label_status, 185, 283);
 
+    preview_touch_area = lv_obj_create(screen_camera);
+    lv_obj_set_size(preview_touch_area, VIDEO_W, VIDEO_H);
+    lv_obj_set_pos(preview_touch_area, VIDEO_POS_X, VIDEO_POS_Y);
+    lv_obj_set_style_bg_opa(preview_touch_area, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(preview_touch_area, 0, 0);
+    lv_obj_set_style_pad_all(preview_touch_area, 0, 0);
+    lv_obj_clear_flag(preview_touch_area, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(preview_touch_area, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(preview_touch_area, preview_gesture_callback, LV_EVENT_GESTURE, NULL);
+
+    label_pic_zone = lv_label_create(screen_camera);
+    lv_label_set_text(label_pic_zone, "Pic Z1");
+    lv_obj_set_style_text_color(label_pic_zone, lv_color_white(), 0);
+    lv_obj_set_style_text_font(label_pic_zone, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(label_pic_zone, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(label_pic_zone, LV_OPA_60, 0);
+    lv_obj_set_style_pad_all(label_pic_zone, 3, 0);
+    lv_obj_set_pos(label_pic_zone, VIDEO_POS_X + VIDEO_W - 48, VIDEO_POS_Y + VIDEO_H - 18);
+    lv_obj_add_flag(label_pic_zone, LV_OBJ_FLAG_HIDDEN);
+
+    upload_panel = lv_obj_create(screen_camera);
+    lv_obj_set_size(upload_panel, VIDEO_W, VIDEO_H);
+    lv_obj_set_pos(upload_panel, VIDEO_POS_X, VIDEO_POS_Y);
+    lv_obj_set_style_bg_color(upload_panel, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(upload_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(upload_panel, 0, 0);
+    lv_obj_set_style_radius(upload_panel, 0, 0);
+    lv_obj_set_style_shadow_width(upload_panel, 0, 0);
+    lv_obj_clear_flag(upload_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(upload_panel, LV_OBJ_FLAG_HIDDEN);
+
+    upload_arc = lv_arc_create(screen_camera);
+    lv_obj_set_size(upload_arc, 128, 128);
+    lv_obj_set_pos(upload_arc, VIDEO_POS_X + 8, VIDEO_POS_Y + 48);
+    lv_arc_set_range(upload_arc, 0, 100);
+    lv_arc_set_bg_angles(upload_arc, 0, 360);
+    lv_arc_set_rotation(upload_arc, 270);
+    lv_arc_set_value(upload_arc, 0);
+    lv_obj_set_style_arc_width(upload_arc, 12, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(upload_arc, lv_color_hex(0xE9EDF9), LV_PART_MAIN);
+    lv_obj_set_style_arc_rounded(upload_arc, true, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(upload_arc, 12, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(upload_arc, lv_color_hex(0x2F80ED), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(upload_arc, true, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(upload_arc, LV_OPA_TRANSP, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(upload_arc, 0, LV_PART_KNOB);
+    lv_obj_clear_flag(upload_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(upload_arc, LV_OBJ_FLAG_HIDDEN);
+
+    upload_percent_label = lv_label_create(screen_camera);
+    lv_label_set_text(upload_percent_label, "0%");
+    lv_obj_set_style_text_font(upload_percent_label, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(upload_percent_label, lv_color_black(), 0);
+    lv_obj_align_to(upload_percent_label, upload_arc, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_add_flag(upload_percent_label, LV_OBJ_FLAG_HIDDEN);
+
+    upload_stage_label = lv_label_create(screen_camera);
+    lv_label_set_text(upload_stage_label, "Preparing");
+    lv_obj_set_width(upload_stage_label, VIDEO_W - 12);
+    lv_label_set_long_mode(upload_stage_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(upload_stage_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(upload_stage_label, lv_color_hex(0x4B5563), 0);
+    lv_obj_set_style_text_align(upload_stage_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(upload_stage_label, VIDEO_POS_X + 6, VIDEO_POS_Y + 188);
+    lv_obj_add_flag(upload_stage_label, LV_OBJ_FLAG_HIDDEN);
+
     switch_state(STATE_CONNECTING);
     update_height_label();
     lv_scr_load(screen_camera);
@@ -1388,8 +1976,14 @@ void ui_camera_handle_k230_status(const char *status_str)
             capture_cancelled = false;
             return;
         }
-        request_label_update("Scan Done");
-        request_state_change(STATE_POS_SUCCESS);
+        request_label_update("Upload");
+        request_state_change(STATE_UPLOAD_READY);
+    } else if (strncmp(status_str, "UPLOAD_READY", 12) == 0) {
+        request_label_update("Upload");
+        request_state_change(STATE_UPLOAD_READY);
+    } else if (strncmp(status_str, "MODEL_ERROR", 11) == 0) {
+        request_label_update("Upload Fail");
+        request_state_change(STATE_UPLOAD_FAILED);
     }
 }
 

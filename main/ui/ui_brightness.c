@@ -12,7 +12,7 @@
 static lv_obj_t *screen_brightness = NULL;
 static lv_obj_t *slider = NULL;
 static lv_obj_t *label_value = NULL;
-static uint32_t brightness_level = 80;
+static uint32_t brightness_level = 100;
 
 // 背光GPIO
 #define BACKLIGHT_GPIO 2
@@ -122,7 +122,7 @@ void ui_brightness_create(void)
     lv_obj_set_size(slider, 200, 15);
     lv_obj_align(slider, LV_ALIGN_CENTER, 0, -20);
     lv_slider_set_range(slider, 0, 100);
-    lv_slider_set_value(slider, brightness_level, LV_ANIM_ON);
+    lv_slider_set_value(slider, brightness_level, LV_ANIM_OFF);
     lv_obj_set_style_bg_color(slider, lv_color_hex(0xFF9800), LV_PART_KNOB);
     lv_obj_set_style_bg_color(slider, lv_color_hex(0xFFCC80), LV_PART_INDICATOR);
     lv_obj_add_event_cb(slider, slider_callback, LV_EVENT_ALL, NULL);

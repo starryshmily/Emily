@@ -80,9 +80,13 @@ bool c3_uart_init(void)
 
 int c3_uart_send(const char *data)
 {
+    // 自动初始化 (首次调用时)
     if (!uart_initialized) {
-        ESP_LOGE(TAG, "UART not initialized, cannot send!");
-        return -1;
+        ESP_LOGI(TAG, "First call - initializing UART...");
+        if (!c3_uart_init()) {
+            ESP_LOGE(TAG, "UART init failed! Cannot send");
+            return -1;
+        }
     }
 
     int len = strlen(data);

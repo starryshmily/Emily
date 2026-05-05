@@ -37,6 +37,7 @@ esp_err_t history_store_add_full(const char *model_name,
                                  const char *pointcloud_size,
                                  const char *model_path);
 esp_err_t history_store_rename(int storage_index, const char *new_name);
+esp_err_t history_store_delete(int storage_index);
 size_t history_store_count(void);
 size_t history_store_get_all(history_record_t *records, size_t max_records);
 

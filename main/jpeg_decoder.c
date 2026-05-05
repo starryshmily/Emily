@@ -104,10 +104,11 @@ esp_err_t jpeg_get_dimensions(const uint8_t *jpeg_data, size_t jpeg_size,
     }
 
     // 查找SOF0标记 (0xFFC0)
-    for (size_t i = 0; i < jpeg_size - 8; i++) {
+    // SOF0格式: FF C0 [2B length] [1B precision] [2B height] [2B width]
+    for (size_t i = 0; i < jpeg_size - 9; i++) {
         if (jpeg_data[i] == 0xFF && jpeg_data[i + 1] == 0xC0) {
-            *height = (jpeg_data[i + 3] << 8) | jpeg_data[i + 4];
-            *width = (jpeg_data[i + 5] << 8) | jpeg_data[i + 6];
+            *height = (jpeg_data[i + 5] << 8) | jpeg_data[i + 6];
+            *width = (jpeg_data[i + 7] << 8) | jpeg_data[i + 8];
             return ESP_OK;
         }
     }
@@ -164,7 +165,7 @@ esp_err_t jpeg_decode_to_rgb565(const uint8_t *jpeg_data, size_t jpeg_size,
     }
 
     // tjpgd缩放：0=原图, 1=1/2, 2=1/4, 3=1/8
-    int scale = 1;
+    int scale = (config->scale >= 0 && config->scale <= 3) ? config->scale : 1;
     ctx.output_width = jdec.width >> scale;
     ctx.output_height = jdec.height >> scale;
 

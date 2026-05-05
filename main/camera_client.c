@@ -726,7 +726,7 @@ esp_err_t k230_client_start_upload_test(void)
 
 esp_err_t k230_client_get_preview_image(int zone, int offset_y, uint8_t **data, size_t *len)
 {
-    if (!data || !len || zone < 1 || zone > 3) {
+    if (!data || !len || zone < 0 || zone > 3) {
         return ESP_ERR_INVALID_ARG;
     }
     *data = NULL;
@@ -755,7 +755,7 @@ esp_err_t k230_client_get_preview_image(int zone, int offset_y, uint8_t **data, 
     }
 
     int content_len = esp_http_client_fetch_headers(client);
-    if (content_len <= 0 || content_len > 120 * 1024) {
+    if (content_len <= 0 || content_len > 150 * 1024) {
         ESP_LOGW(TAG, "Preview image unsupported size: %d", content_len);
         esp_http_client_close(client);
         esp_http_client_cleanup(client);

@@ -192,6 +192,40 @@ esp_err_t history_store_rename(int storage_index, const char *new_name)
     return err;
 }
 
+esp_err_t history_store_delete(int storage_index)
+{
+    if (storage_index < 0 || storage_index >= HISTORY_STORE_MAX_RECORDS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = history_store_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    nvs_handle_t handle;
+    err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    char key[16];
+    const char *prefixes[] = {"name", "time", "msize", "psize", "path"};
+    for (int i = 0; i < 5; i++) {
+        make_key(key, sizeof(key), prefixes[i], storage_index);
+        nvs_erase_key(handle, key);
+    }
+    err = nvs_commit(handle);
+    nvs_close(handle);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "deleted history[%d]", storage_index);
+    } else {
+        ESP_LOGE(TAG, "delete history failed: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
 size_t history_store_count(void)
 {
     if (history_store_init() != ESP_OK) {

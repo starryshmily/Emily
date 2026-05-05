@@ -22,7 +22,16 @@
       "WebFetch(domain:wiki.lckfb.com)",
       "WebFetch(domain:developer.canaan-creative.com)",
       "Bash(docker --version)",
-      "Bash(where docker *)"
+      "Bash(where docker *)",
+      "Bash(cmd.exe /c \"\\\\\"C:\\\\\\\\Espressif\\\\\\\\idf_cmd_init.bat\\\\\" && idf.py build\")",
+      "Bash(cmd.exe /c \"dir C:\\\\\\\\Espressif\\\\\\\\frameworks\\\\\\\\\")",
+      "Bash(cmd.exe /c \"idf.py build 2>&1\")",
+      "Bash(cmd.exe /c \"cd /d D:\\\\Emily\\\\lvgl_demo && idf.py build\")",
+      "Bash(powershell.exe -Command \"cd D:\\\\Emily\\\\lvgl_demo; idf.py build 2>&1\")",
+      "Bash(powershell.exe -Command \"Get-ChildItem 'C:\\\\Espressif' -ErrorAction SilentlyContinue | Select-Object Name; Get-ChildItem 'C:\\\\Users\\\\ASUS\\\\.espressif' -ErrorAction SilentlyContinue | Select-Object Name; Get-ChildItem env:IDF_PATH -ErrorAction SilentlyContinue\")",
+      "Bash(powershell.exe -Command '& { $env:IDF_PATH = '\\\\''D:\\\\Espressif\\\\frameworks\\\\esp-idf-v5.1.2'\\\\''; cd D:\\\\Emily\\\\lvgl_demo; python $env:IDF_PATH\\\\tools\\\\idf.py build 2>&1 }')",
+      "Bash(cmd.exe /c \"D:\\\\Espressif\\\\frameworks\\\\esp-idf-v5.1.2\\\\export.bat >nul 2>&1 && cd /d D:\\\\Emily\\\\lvgl_demo && idf.py build 2>&1\")",
+      "Bash(cmd.exe //c \"call D:\\\\Espressif\\\\frameworks\\\\esp-idf-v5.1.2\\\\export.bat >nul 2>&1 && cd /d D:\\\\Emily\\\\lvgl_demo && idf.py build\")"
     ]
   }
 }

@@ -75,7 +75,6 @@ static lv_obj_t *btn_down = NULL;
 static lv_obj_t *btn_zero = NULL;  // Zero归零按钮
 static lv_obj_t *btn_calibrate = NULL;  // 校准按钮
 static lv_obj_t *label_calibrate = NULL; // 校准按钮文字
-static lv_obj_t *preview_touch_area = NULL;
 static lv_obj_t *label_pic_zone = NULL;
 static lv_obj_t *upload_panel = NULL;
 static lv_obj_t *upload_arc = NULL;
@@ -121,6 +120,18 @@ static volatile bool pending_cancel_capture = false; // Cancel during CAPTURING 
 static volatile bool preview_mode = false;
 static volatile int preview_zone = 1;
 static volatile int preview_offset_y = 0;
+static int preview_total_h = 0;  // Total image height from JPEG header
+
+// Pre-downloaded JPEG cache for instant zone switching
+// Zone numbers: 0=Bottom, 1=Z1, 2=Z2, 3=Z3
+static uint8_t *preview_jpeg_cache[4] = {NULL};  // [0]=bottom, [1]=z1, [2]=z2, [3]=z3
+static size_t preview_jpeg_cache_len[4] = {0};
+static volatile bool preview_cache_ready = false;
+static bool preview_zone_available[4] = {false};  // which zones actually have photos
+static int preview_zone_list[4] = {0};            // available zone numbers (max 4: bottom+z1+z2+z3)
+static int preview_zone_count = 0;                // number of available zones
+static int preview_zone_index = 0;                // current index into preview_zone_list
+
 static TaskHandle_t preview_task_handle = NULL;
 static float height_before_calib = 0.0f;  // 校准前的高度（用于校准模式取消）
 
@@ -305,58 +316,154 @@ static void request_label_update(const char *text)
 static void update_pic_zone_label(void)
 {
     if (!label_pic_zone) return;
-    lv_label_set_text_fmt(label_pic_zone, "Pic Z%d", preview_zone);
+    if (preview_zone == 0) {
+        lv_label_set_text(label_pic_zone, "Pic Btm");
+    } else {
+        lv_label_set_text_fmt(label_pic_zone, "Pic Z%d", preview_zone);
+    }
 }
 
-static void preview_load_task(void *arg)
+static void preview_free_cache(void)
 {
-    int zone = preview_zone;
-    int offset = preview_offset_y;
-    uint8_t *jpeg_data = NULL;
-    size_t jpeg_len = 0;
+    for (int i = 0; i <= 3; i++) {
+        if (preview_jpeg_cache[i]) {
+            free(preview_jpeg_cache[i]);
+            preview_jpeg_cache[i] = NULL;
+        }
+        preview_jpeg_cache_len[i] = 0;
+        preview_zone_available[i] = false;
+    }
+    preview_cache_ready = false;
+    preview_zone_count = 0;
+    preview_zone_index = 0;
+}
 
-    esp_err_t err = k230_client_get_preview_image(zone, offset, &jpeg_data, &jpeg_len);
-    if (err == ESP_OK && jpeg_data && jpeg_len > 0) {
-        if (xSemaphoreTake(video_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+static void preview_cache_download_task(void *arg)
+{
+    ESP_LOGI(TAG, "Pre-downloading all preview images...");
+    preview_zone_count = 0;
+    // Download order: Z1, Z2, Z3, Bottom(0)
+    static const int zone_order[] = {1, 2, 3, 0};
+    for (int i = 0; i < 4; i++) {
+        int zone = zone_order[i];
+        uint8_t *jpeg_data = NULL;
+        size_t jpeg_len = 0;
+        esp_err_t err = k230_client_get_preview_image(zone, 0, &jpeg_data, &jpeg_len);
+        if (err == ESP_OK && jpeg_data && jpeg_len > 0) {
+            preview_jpeg_cache[zone] = jpeg_data;
+            preview_jpeg_cache_len[zone] = jpeg_len;
+            preview_zone_available[zone] = true;
+            preview_zone_list[preview_zone_count++] = zone;
+            ESP_LOGI(TAG, "Cached Z%d: %u bytes", zone, (unsigned)jpeg_len);
+        } else {
+            preview_zone_available[zone] = false;
+            ESP_LOGI(TAG, "Z%d not available", zone);
+            if (jpeg_data) free(jpeg_data);
+        }
+    }
+    preview_cache_ready = true;
+
+    if (preview_zone_count == 0) {
+        ESP_LOGW(TAG, "No preview images available");
+        preview_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Start at first available zone
+    preview_zone_index = 0;
+    preview_zone = preview_zone_list[0];
+    ESP_LOGI(TAG, "Available zones: %d, starting at Z%d", preview_zone_count, preview_zone);
+
+    // Update zone label with actual first available zone
+    if (label_pic_zone) {
+        if (preview_zone == 0) {
+            lv_label_set_text(label_pic_zone, "Pic Btm");
+        } else {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "Pic Z%d", preview_zone);
+            lv_label_set_text(label_pic_zone, buf);
+        }
+        lv_obj_clear_flag(label_pic_zone, LV_OBJ_FLAG_HIDDEN);
+    }
+    int zone = preview_zone;
+    if (preview_jpeg_cache[zone] && preview_jpeg_cache_len[zone] > 0) {
+        int img_w = 0, img_h = 0;
+        jpeg_get_dimensions(preview_jpeg_cache[zone], preview_jpeg_cache_len[zone], &img_w, &img_h);
+        ESP_LOGI(TAG, "Preview JPEG: zone=%d %dx%d", zone, img_w, img_h);
+
+        if (img_w > 0 && img_h > 0 && img_w <= 300 && img_h <= 600 &&
+            xSemaphoreTake(video_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            preview_total_h = img_h;
+            memset(video_buffer, 0, VIDEO_W * VIDEO_H * 2);
             jpeg_decode_config_t cfg = {
                 .output_buffer = video_buffer,
                 .output_size = VIDEO_W * VIDEO_H * 2,
-                .output_width = 256,
-                .output_height = 144,
-                .rotate_90 = true,
+                .output_width = img_w,
+                .output_height = img_h,
+                .rotate_90 = false,
+                .scale = 0,
             };
-
-            if (jpeg_decode_to_rgb565(jpeg_data, jpeg_len, &cfg) == ESP_OK) {
+            if (jpeg_decode_to_rgb565(preview_jpeg_cache[zone], preview_jpeg_cache_len[zone], &cfg) == ESP_OK) {
                 if (xSemaphoreTakeRecursive(lcd_draw_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    app_lcd_draw_bitmap(
-                        VIDEO_POS_X, VIDEO_POS_Y,
-                        VIDEO_POS_X + VIDEO_W, VIDEO_POS_Y + VIDEO_H,
-                        video_buffer
-                    );
+                    app_lcd_draw_bitmap(VIDEO_POS_X, VIDEO_POS_Y,
+                                        VIDEO_POS_X + VIDEO_W, VIDEO_POS_Y + VIDEO_H,
+                                        video_buffer);
                     xSemaphoreGiveRecursive(lcd_draw_mutex);
                 }
-            } else {
-                ESP_LOGW(TAG, "Preview decode failed: zone=%d len=%u", zone, (unsigned)jpeg_len);
             }
             xSemaphoreGive(video_mutex);
         }
-    } else {
-        ESP_LOGW(TAG, "Preview load failed: zone=%d offset=%d err=%s", zone, offset, esp_err_to_name(err));
     }
 
-    if (jpeg_data) {
-        free(jpeg_data);
-    }
     preview_task_handle = NULL;
     vTaskDelete(NULL);
 }
 
+static void preview_show_cached_zone(int zone)
+{
+    if (!preview_jpeg_cache[zone] || preview_jpeg_cache_len[zone] == 0) return;
+
+    int img_w = 0, img_h = 0;
+    jpeg_get_dimensions(preview_jpeg_cache[zone], preview_jpeg_cache_len[zone], &img_w, &img_h);
+    if (img_w <= 0 || img_h <= 0 || img_w > 300 || img_h > 600) return;
+
+    if (xSemaphoreTake(video_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+
+    preview_total_h = img_h;
+    memset(video_buffer, 0, VIDEO_W * VIDEO_H * 2);
+    jpeg_decode_config_t cfg = {
+        .output_buffer = video_buffer,
+        .output_size = VIDEO_W * VIDEO_H * 2,
+        .output_width = img_w,
+        .output_height = img_h,
+        .rotate_90 = false,
+        .scale = 0,
+    };
+    if (jpeg_decode_to_rgb565(preview_jpeg_cache[zone], preview_jpeg_cache_len[zone], &cfg) == ESP_OK) {
+        if (xSemaphoreTakeRecursive(lcd_draw_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            app_lcd_draw_bitmap(VIDEO_POS_X, VIDEO_POS_Y,
+                                VIDEO_POS_X + VIDEO_W, VIDEO_POS_Y + VIDEO_H,
+                                video_buffer);
+            xSemaphoreGiveRecursive(lcd_draw_mutex);
+        }
+    }
+    xSemaphoreGive(video_mutex);
+}
+
 static void request_preview_load(void)
 {
-    if (!preview_mode || preview_task_handle) {
+    if (!preview_mode) return;
+
+    if (preview_cache_ready) {
+        // Cache available — decode instantly, no network request
+        preview_show_cached_zone(preview_zone);
         return;
     }
-    xTaskCreate(preview_load_task, "preview_img", 4096, NULL, 4, &preview_task_handle);
+
+    // Cache not ready yet, start download task
+    if (preview_task_handle) return;
+    xTaskCreate(preview_cache_download_task, "preview_img", 4096, NULL, 4, &preview_task_handle);
 }
 
 static void preview_gesture_callback(lv_event_t *e)
@@ -367,24 +474,38 @@ static void preview_gesture_callback(lv_event_t *e)
 
     lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_get_act());
     if (dir == LV_DIR_LEFT) {
-        preview_zone++;
-        if (preview_zone > 3) preview_zone = 1;
+        if (preview_zone_count <= 1) return;  // only one zone, no swiping
+        preview_zone_index++;
+        if (preview_zone_index >= preview_zone_count) preview_zone_index = 0;
+        preview_zone = preview_zone_list[preview_zone_index];
         preview_offset_y = 0;
+        update_pic_zone_label();
+        request_preview_load();
     } else if (dir == LV_DIR_RIGHT) {
-        preview_zone--;
-        if (preview_zone < 1) preview_zone = 3;
+        if (preview_zone_count <= 1) return;
+        preview_zone_index--;
+        if (preview_zone_index < 0) preview_zone_index = preview_zone_count - 1;
+        preview_zone = preview_zone_list[preview_zone_index];
         preview_offset_y = 0;
+        update_pic_zone_label();
+        request_preview_load();
     } else if (dir == LV_DIR_TOP) {
-        preview_offset_y += 120;
+        // Scroll down (see content below)
+        if (preview_total_h > VIDEO_H) {
+            preview_offset_y += 120;
+            if (preview_offset_y > preview_total_h - VIDEO_H) {
+                preview_offset_y = preview_total_h - VIDEO_H;
+            }
+            request_preview_load();
+        }
     } else if (dir == LV_DIR_BOTTOM) {
-        preview_offset_y -= 120;
-        if (preview_offset_y < 0) preview_offset_y = 0;
-    } else {
-        return;
+        // Scroll up
+        if (preview_total_h > VIDEO_H && preview_offset_y > 0) {
+            preview_offset_y -= 120;
+            if (preview_offset_y < 0) preview_offset_y = 0;
+            request_preview_load();
+        }
     }
-
-    update_pic_zone_label();
-    request_preview_load();
 }
 
 static void log_upload_ready_paths(const char *clean)
@@ -441,7 +562,7 @@ static void show_upload_progress(bool show)
         lv_obj_clear_flag(upload_arc, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(upload_percent_label, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(upload_stage_label, LV_OBJ_FLAG_HIDDEN);
-        if (preview_touch_area) lv_obj_add_flag(preview_touch_area, LV_OBJ_FLAG_HIDDEN);
+
         if (label_pic_zone) lv_obj_add_flag(label_pic_zone, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_add_flag(upload_panel, LV_OBJ_FLAG_HIDDEN);
@@ -576,12 +697,16 @@ static void cleanup_camera_page_resources(void)
     btn_zero = NULL;
     btn_calibrate = NULL;
     label_calibrate = NULL;
-    preview_touch_area = NULL;
+
     label_pic_zone = NULL;
     upload_panel = NULL;
     upload_arc = NULL;
     upload_percent_label = NULL;
     upload_stage_label = NULL;
+
+    preview_free_cache();
+    preview_total_h = 0;
+    preview_offset_y = 0;
 
     slider_height_mm = 0;
     slider_moving = false;
@@ -630,9 +755,11 @@ static void switch_state(camera_state_t new_state)
 
     case STATE_IDLE:
         preview_mode = false;
-        if (preview_touch_area) lv_obj_add_flag(preview_touch_area, LV_OBJ_FLAG_HIDDEN);
+
         if (label_pic_zone) lv_obj_add_flag(label_pic_zone, LV_OBJ_FLAG_HIDDEN);
-        label_status ? lv_label_set_text(label_status, "Ready") : (void)0;
+        preview_free_cache();
+        preview_total_h = 0;
+        if (label_status) { lv_obj_clear_flag(label_status, LV_OBJ_FLAG_HIDDEN); lv_label_set_text(label_status, "Ready"); }
         lv_label_set_text(label_start, "Start");
         set_btn_style(btn_start, COLOR_GREEN, true);
         update_up_down_buttons();
@@ -722,8 +849,10 @@ static void switch_state(camera_state_t new_state)
 
     case STATE_CAPTURING:
         preview_mode = false;
-        if (preview_touch_area) lv_obj_add_flag(preview_touch_area, LV_OBJ_FLAG_HIDDEN);
+
         if (label_pic_zone) lv_obj_add_flag(label_pic_zone, LV_OBJ_FLAG_HIDDEN);
+        preview_free_cache();
+        preview_total_h = 0;
         label_status ? lv_label_set_text(label_status, "Zone 1...") : (void)0;
         set_btn_disabled(btn_start, COLOR_GRAY);
         set_btn_disabled(btn_up, COLOR_GRAY);
@@ -737,8 +866,9 @@ static void switch_state(camera_state_t new_state)
         show_upload_progress(false);
         preview_mode = true;
         preview_zone = 1;
+        preview_zone_index = 0;
         preview_offset_y = 0;
-        label_status ? lv_label_set_text(label_status, "Upload") : (void)0;
+        if (label_status) lv_obj_add_flag(label_status, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text(label_start, "Upload");
         set_btn_style(btn_start, COLOR_GREEN, true);
         set_btn_disabled(btn_up, COLOR_GRAY);
@@ -746,18 +876,18 @@ static void switch_state(camera_state_t new_state)
         set_btn_disabled(btn_zero, COLOR_GRAY);
         set_btn_style(btn_cancel, COLOR_RED, true);
         if (btn_calibrate) lv_obj_add_flag(btn_calibrate, LV_OBJ_FLAG_HIDDEN);
-        if (preview_touch_area) lv_obj_clear_flag(preview_touch_area, LV_OBJ_FLAG_HIDDEN);
-        if (label_pic_zone) {
-            lv_obj_clear_flag(label_pic_zone, LV_OBJ_FLAG_HIDDEN);
-            update_pic_zone_label();
-        }
+
+        // Label hidden until cache download sets the correct zone
+        if (label_pic_zone) lv_obj_add_flag(label_pic_zone, LV_OBJ_FLAG_HIDDEN);
         request_preview_load();
         break;
 
     case STATE_UPLOADING:
         preview_mode = false;
+        preview_free_cache();
+        preview_total_h = 0;
         set_upload_progress_animated(5, "Preparing");
-        label_status ? lv_label_set_text(label_status, "Uploading") : (void)0;
+        label_status ? lv_obj_clear_flag(label_status, LV_OBJ_FLAG_HIDDEN), lv_label_set_text(label_status, "Uploading") : (void)0;
         lv_label_set_text(label_start, "Wait");
         set_btn_disabled(btn_start, COLOR_GRAY);
         set_btn_disabled(btn_up, COLOR_GRAY);
@@ -768,7 +898,10 @@ static void switch_state(camera_state_t new_state)
         break;
 
     case STATE_UPLOAD_FAILED:
-        label_status ? lv_label_set_text(label_status, "Upload Fail") : (void)0;
+        preview_mode = false;
+        preview_free_cache();
+        preview_total_h = 0;
+        label_status ? lv_obj_clear_flag(label_status, LV_OBJ_FLAG_HIDDEN), lv_label_set_text(label_status, "Upload Fail") : (void)0;
         lv_label_set_text(label_start, "Upload");
         set_btn_style(btn_start, COLOR_ORANGE, true);
         set_btn_disabled(btn_up, COLOR_GRAY);
@@ -779,8 +912,11 @@ static void switch_state(camera_state_t new_state)
         break;
 
     case STATE_MODEL_DONE:
+        preview_mode = false;
+        preview_free_cache();
+        preview_total_h = 0;
         set_upload_progress_animated(100, "Done");
-        label_status ? lv_label_set_text(label_status, "Done") : (void)0;
+        label_status ? lv_obj_clear_flag(label_status, LV_OBJ_FLAG_HIDDEN), lv_label_set_text(label_status, "Done") : (void)0;
         lv_label_set_text(label_start, "Done");
         set_btn_disabled(btn_start, COLOR_GRAY);
         set_btn_disabled(btn_up, COLOR_GRAY);
@@ -1287,6 +1423,7 @@ static void video_frame_callback(const uint8_t *jpeg_data, size_t jpeg_len)
         .output_width = 256,
         .output_height = 144,
         .rotate_90 = true,
+        .scale = 1,
     };
 
     esp_err_t err = jpeg_decode_to_rgb565(jpeg_data, jpeg_len, &cfg);
@@ -1465,7 +1602,7 @@ static void btn_cancel_callback(lv_event_t *e)
                current_state == STATE_UPLOAD_FAILED || current_state == STATE_MODEL_DONE) {
         ESP_LOGI(TAG, "Cancel upload/model state: sending HOME and returning IDLE");
         preview_mode = false;
-        if (preview_touch_area) lv_obj_add_flag(preview_touch_area, LV_OBJ_FLAG_HIDDEN);
+
         if (label_pic_zone) lv_obj_add_flag(label_pic_zone, LV_OBJ_FLAG_HIDDEN);
         slider_moving = true;
         pending_move_direction = -1;
@@ -1622,6 +1759,28 @@ void ui_camera_create(void)
 
         // 重置后台模式
         bg_keepalive_mode = false;
+
+        // Upload Test模式：停止视频流，直接进入上传等待状态
+        if (developer_mode_is_upload_test()) {
+            ESP_LOGI(TAG, "Upload Test enabled in background resume: stopping stream");
+            k230_client_force_stop_stream();
+            vTaskDelay(pdMS_TO_TICKS(300));
+
+            if (screen_camera) {
+                lv_scr_load(screen_camera);
+            }
+
+            esp_err_t err = k230_client_start_upload_test();
+            if (err == ESP_OK) {
+                first_frame_received = true;
+                request_label_update("Upload");
+                request_state_change(STATE_UPLOAD_READY);
+            } else {
+                ESP_LOGE(TAG, "Upload Test request failed: %s", esp_err_to_name(err));
+                request_state_change(STATE_CONN_FAILED);
+            }
+            return;
+        }
 
         // 恢复frame callback
         k230_client_set_frame_callback(video_frame_callback);
@@ -1843,24 +2002,14 @@ void ui_camera_create(void)
     lv_obj_set_style_text_color(label_status, lv_color_hex(0xAAAAAA), 0);
     lv_obj_set_pos(label_status, 185, 283);
 
-    preview_touch_area = lv_obj_create(screen_camera);
-    lv_obj_set_size(preview_touch_area, VIDEO_W, VIDEO_H);
-    lv_obj_set_pos(preview_touch_area, VIDEO_POS_X, VIDEO_POS_Y);
-    lv_obj_set_style_bg_opa(preview_touch_area, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(preview_touch_area, 0, 0);
-    lv_obj_set_style_pad_all(preview_touch_area, 0, 0);
-    lv_obj_clear_flag(preview_touch_area, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(preview_touch_area, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(preview_touch_area, preview_gesture_callback, LV_EVENT_GESTURE, NULL);
+    // Gesture detection on screen — child gestures bubble UP here (buttons have GESTURE_BUBBLE by default)
+    // Do NOT set GESTURE_BUBBLE on screen itself, or gesture will bubble to NULL parent
+    lv_obj_add_event_cb(screen_camera, preview_gesture_callback, LV_EVENT_GESTURE, NULL);
 
     label_pic_zone = lv_label_create(screen_camera);
     lv_label_set_text(label_pic_zone, "Pic Z1");
-    lv_obj_set_style_text_color(label_pic_zone, lv_color_white(), 0);
-    lv_obj_set_style_text_font(label_pic_zone, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_bg_color(label_pic_zone, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(label_pic_zone, LV_OPA_60, 0);
-    lv_obj_set_style_pad_all(label_pic_zone, 3, 0);
-    lv_obj_set_pos(label_pic_zone, VIDEO_POS_X + VIDEO_W - 48, VIDEO_POS_Y + VIDEO_H - 18);
+    lv_obj_set_style_text_color(label_pic_zone, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_set_pos(label_pic_zone, 185, 283);
     lv_obj_add_flag(label_pic_zone, LV_OBJ_FLAG_HIDDEN);
 
     upload_panel = lv_obj_create(screen_camera);
@@ -2051,6 +2200,13 @@ static void delayed_disconnect_callback(void *arg)
 
     // 重置状态
     current_state = STATE_CONNECTING;
+
+    // 删除Camera屏幕释放LVGL内存
+    if (screen_camera) {
+        lv_obj_t *old_screen = screen_camera;
+        screen_camera = NULL;
+        lv_obj_del_async(old_screen);
+    }
 
     ESP_LOGI(TAG, "Delayed disconnect complete");
 }

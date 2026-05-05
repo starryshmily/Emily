@@ -23,6 +23,7 @@ typedef struct {
     int output_width;             // 期望输出宽度（旋转前）
     int output_height;            // 期望输出高度（旋转前）
     bool rotate_90;               // 是否旋转90度（横屏转竖屏）
+    int scale;                    // 缩放: 0=原图, 1=1/2, 2=1/4, 3=1/8
 } jpeg_decode_config_t;
 
 /**

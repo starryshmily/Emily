@@ -116,6 +116,7 @@ static volatile bool cmd_send_lock = false;        // 命令发送锁，防止UP
 static volatile int64_t last_move_send_time_ms = 0; // 上次发送UP/DOWN的时间
 #define MIN_MOVE_INTERVAL_MS 1500  // 两次UP/DOWN最短间隔(ms)，防止触摸抖动双发
 static volatile bool capture_cancelled = false;    // Cancel during CAPTURING, ignore late ALL_DONE
+static volatile bool upload_cancelled = false;     // Cancel during UPLOADING, ignore late MODEL messages
 static volatile bool pending_cancel_capture = false; // Cancel during CAPTURING motor move, wait for HEIGHT then STOP
 static volatile bool preview_mode = false;
 static volatile int preview_zone = 1;
@@ -159,6 +160,7 @@ static void start_delayed_disconnect(void);  // 延迟断开（后台保活）
 bool ui_camera_is_in_background(void);  // 后台保活模式检查
 static void request_preview_load(void);
 static void cleanup_camera_page_resources(void);
+static void upload_start_task(void *arg);
 static void show_upload_progress(bool show);
 static void set_upload_progress_animated(int percent, const char *stage);
 
@@ -451,13 +453,22 @@ static void preview_show_cached_zone(int zone)
     xSemaphoreGive(video_mutex);
 }
 
+static void preview_show_cached_timer_cb(lv_timer_t *timer)
+{
+    lv_timer_del(timer);
+    if (preview_mode && preview_cache_ready) {
+        preview_show_cached_zone(preview_zone);
+    }
+}
+
 static void request_preview_load(void)
 {
     if (!preview_mode) return;
 
     if (preview_cache_ready) {
-        // Cache available — decode instantly, no network request
-        preview_show_cached_zone(preview_zone);
+        // Defer to next LVGL cycle so screen refresh completes first
+        lv_timer_t *t = lv_timer_create(preview_show_cached_timer_cb, 50, NULL);
+        lv_timer_set_repeat_count(t, 1);
         return;
     }
 
@@ -884,7 +895,8 @@ static void switch_state(camera_state_t new_state)
 
     case STATE_UPLOADING:
         preview_mode = false;
-        preview_free_cache();
+        upload_cancelled = false;  // Fresh upload, reset cancel flag
+        // Keep preview cache alive for cancel-back-to-UPLOAD_READY
         preview_total_h = 0;
         set_upload_progress_animated(5, "Preparing");
         label_status ? lv_obj_clear_flag(label_status, LV_OBJ_FLAG_HIDDEN), lv_label_set_text(label_status, "Uploading") : (void)0;
@@ -1116,13 +1128,16 @@ static void process_uart_message(const char *clean)
         request_label_update("Upload");
         request_state_change(STATE_UPLOAD_READY);
     } else if (strncmp(clean, "MODEL_PROGRESS|", 15) == 0) {
+        if (upload_cancelled) return;
         ui_camera_heartbeat();
         handle_model_progress(clean);
         request_state_change(STATE_UPLOADING);
     } else if (strcmp(clean, "MODEL_UPLOAD") == 0 || strcmp(clean, "MODEL_WAIT") == 0) {
+        if (upload_cancelled) return;
         ui_camera_heartbeat();
         request_state_change(STATE_UPLOADING);
     } else if (strncmp(clean, "MODEL_ERROR", 11) == 0) {
+        if (upload_cancelled) return;
         ui_camera_heartbeat();
         request_label_update("Upload Fail");
         request_state_change(STATE_UPLOAD_FAILED);
@@ -1533,6 +1548,16 @@ static void btn_back_callback(lv_event_t *e)
     }
 }
 
+static void upload_start_task(void *arg)
+{
+    esp_err_t err = k230_client_start_upload();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Upload start failed: %s", esp_err_to_name(err));
+        request_state_change(STATE_UPLOAD_FAILED);
+    }
+    vTaskDelete(NULL);
+}
+
 static void btn_start_callback(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -1549,9 +1574,7 @@ static void btn_start_callback(lv_event_t *e)
     } else if (current_state == STATE_UPLOAD_READY || current_state == STATE_UPLOAD_FAILED) {
         ESP_LOGI(TAG, "Upload: sending UPLOAD to K230");
         switch_state(STATE_UPLOADING);
-        if (k230_client_start_upload() != ESP_OK) {
-            switch_state(STATE_UPLOAD_FAILED);
-        }
+        xTaskCreate(upload_start_task, "upload", 4096, NULL, 4, NULL);
     } else if (current_state == STATE_CONN_FAILED) {
         ESP_LOGI(TAG, "Reconnect: restarting connection to K230");
         first_frame_received = false;  // 重置首帧标志，允许新连接触发IDLE切换
@@ -1600,9 +1623,11 @@ static void btn_cancel_callback(lv_event_t *e)
         switch_state(STATE_IDLE);
     } else if (current_state == STATE_UPLOAD_READY || current_state == STATE_UPLOADING ||
                current_state == STATE_UPLOAD_FAILED || current_state == STATE_MODEL_DONE) {
-        // Cancel upload: go back to preview state, re-download photos
-        preview_free_cache();
-        preview_cache_ready = false;
+        // Cancel upload: go back to preview state (reuse cache if available)
+        upload_cancelled = true;
+        if (!preview_cache_ready) {
+            preview_free_cache();
+        }
         switch_state(STATE_UPLOAD_READY);
     } else if (current_state == STATE_CAPTURING) {
         // 拍摄中取消: 不立即发STOP，等当前移动完成(HEIGHT消息)后再发

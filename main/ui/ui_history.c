@@ -71,7 +71,7 @@ static void init_history_test_records(void)
         snprintf(history_test_records[i].created_time, sizeof(history_test_records[i].created_time), "2026-05-05 %02d:%02d", 9 + i, 10 + i);
         snprintf(history_test_records[i].model_size, sizeof(history_test_records[i].model_size), "%d.%d MB", 2 + i, i % 10);
         snprintf(history_test_records[i].pointcloud_size, sizeof(history_test_records[i].pointcloud_size), "%d.%d MB", 1 + i, (i + 4) % 10);
-        snprintf(history_test_records[i].model_path, sizeof(history_test_records[i].model_path), "/data/test picture/model/test_%02d", i + 1);
+        snprintf(history_test_records[i].model_path, sizeof(history_test_records[i].model_path), "/data/test_picture/model/test_%02d", i + 1);
         history_test_records[i].storage_index = -1 - i;
     }
 

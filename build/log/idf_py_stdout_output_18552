@@ -7,7 +7,7 @@ Processing 5 dependencies:
 [5/5] lvgl/lvgl (8.3.11)
 -- Project sdkconfig file D:/Emily/lvgl_demo/sdkconfig
 Loading defaults file D:/Emily/lvgl_demo/sdkconfig.defaults...
--- App "lvgl_demo" version: 0a1e5af-dirty
+-- App "lvgl_demo" version: d8a556c-dirty
 -- Adding linker script D:/Emily/lvgl_demo/build/esp-idf/esp_system/ld/memory.ld
 -- Adding linker script D:/Espressif/frameworks/esp-idf-v5.1.2/components/esp_system/ld/esp32c3/sections.ld.in
 -- Adding linker script D:/Espressif/frameworks/esp-idf-v5.1.2/components/esp_rom/esp32c3/ld/esp32c3.rom.ld

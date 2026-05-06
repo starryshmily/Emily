@@ -45,6 +45,7 @@ static int32_t anim_start_h = 90;
 // WiFi状态指示器
 static lv_obj_t *wifi_status_label = NULL;
 static lv_obj_t *developer_status_label = NULL;
+static lv_obj_t *camera_keepalive_label = NULL;
 
 // 动画执行回调 - 改变遮罩大小和位置 (250ms优化)
 static void history_delay_timer_cb(lv_timer_t *timer)
@@ -416,6 +417,13 @@ void ui_home_create(void)
     lv_obj_align(developer_status_label, LV_ALIGN_TOP_RIGHT, -27, 12);
     lv_obj_add_flag(developer_status_label, LV_OBJ_FLAG_HIDDEN);
 
+    camera_keepalive_label = lv_label_create(screen_home);
+    lv_label_set_text(camera_keepalive_label, LV_SYMBOL_LOOP);
+    lv_obj_set_style_text_font(camera_keepalive_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(camera_keepalive_label, lv_color_hex(0x2E7D32), 0);
+    lv_obj_align(camera_keepalive_label, LV_ALIGN_TOP_LEFT, 5, 12);
+    lv_obj_add_flag(camera_keepalive_label, LV_OBJ_FLAG_HIDDEN);
+
     // Register WiFi status label with main app
     app_main_set_wifi_status_label(wifi_status_label);
     ui_home_refresh_developer_status();
@@ -469,5 +477,16 @@ void ui_home_refresh_developer_status(void)
         lv_obj_clear_flag(developer_status_label, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_add_flag(developer_status_label, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void ui_home_set_camera_keepalive(bool enabled)
+{
+    if(camera_keepalive_label == NULL) return;
+
+    if(enabled) {
+        lv_obj_clear_flag(camera_keepalive_label, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(camera_keepalive_label, LV_OBJ_FLAG_HIDDEN);
     }
 }

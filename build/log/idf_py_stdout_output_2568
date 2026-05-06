@@ -1,11 +1,11 @@
 [1/14] Performing build step for 'bootloader'
 [1/1] cmd.exe /C "cd /D D:\Emily\lvgl_demo\build\bootloader\esp-idf\esptool_py && D:\Espressif\python_env\idf5.1_py3.11_env\Scripts\python.exe D:/Espressif/frameworks/esp-idf-v5.1.2/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x0 D:/Emily/lvgl_demo/build/bootloader/bootloader.bin"
 Bootloader binary size 0x5070 bytes. 0x2f90 bytes (37%) free.
-[2/12] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/developer_mode.c.obj
-[3/12] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/ui/ui_developer.c.obj
-[4/12] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/ui/ui_history.c.obj
-[5/12] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/ui/ui_settings.c.obj
-[6/12] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/camera_client.c.obj
+[2/12] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/ui/ui_settings.c.obj
+[3/12] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/ui/ui_home.c.obj
+[4/12] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/ui/ui_temp.c.obj
+[5/12] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/ui/ui_history.c.obj
+[6/12] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/spi_lcd_touch_example_main.c.obj
 [7/12] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/ui/ui_camera.c.obj
 [8/12] Linking C static library esp-idf\main\libmain.a
 [9/12] Generating ld/sections.ld
@@ -17,5 +17,5 @@ Merged 2 ELF sections
 Successfully created esp32c3 image.
 Generated D:/Emily/lvgl_demo/build/lvgl_demo.bin
 [12/12] cmd.exe /C "cd /D D:\Emily\lvgl_demo\build\esp-idf\esptool_py && D:\Espressif\python_env\idf5.1_py3.11_env\Scripts\python.exe D:/Espressif/frameworks/esp-idf-v5.1.2/components/partition_table/check_sizes.py --offset 0x8000 partition --type app D:/Emily/lvgl_demo/build/partition_table/partition-table.bin D:/Emily/lvgl_demo/build/lvgl_demo.bin"
-lvgl_demo.bin binary size 0x166880 bytes. Smallest app partition is 0x177000 bytes. 0x10780 bytes (4%) free.
+lvgl_demo.bin binary size 0x168420 bytes. Smallest app partition is 0x177000 bytes. 0xebe0 bytes (4%) free.
 Warning: The smallest app partition is nearly full (4% free space left)!

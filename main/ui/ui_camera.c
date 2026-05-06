@@ -147,6 +147,8 @@ static volatile bool bg_keepalive_mode = false;  // 后台保活模式
 static volatile camera_state_t pending_state = STATE_CONNECTING;
 static volatile bool has_pending_state = false;
 static volatile bool has_pending_ui_update = false;
+static volatile bool has_pending_keepalive_icon = false;
+static volatile bool pending_keepalive_icon_enabled = false;
 static lv_timer_t *deferred_timer = NULL;
 static char pending_label_text[32] = {0};
 static volatile bool has_pending_label = false;
@@ -295,6 +297,10 @@ static void deferred_timer_cb(lv_timer_t *timer)
         has_pending_label = false;
         if (label_status) lv_label_set_text(label_status, pending_label_text);
     }
+    if (has_pending_keepalive_icon) {
+        has_pending_keepalive_icon = false;
+        ui_home_set_camera_keepalive(pending_keepalive_icon_enabled);
+    }
 }
 
 static void request_state_change(camera_state_t new_state)
@@ -314,6 +320,13 @@ static void request_label_update(const char *text)
     pending_label_text[sizeof(pending_label_text) - 1] = '\0';
     has_pending_label = true;
 }
+
+static void request_keepalive_icon_update(bool enabled)
+{
+    pending_keepalive_icon_enabled = enabled;
+    has_pending_keepalive_icon = true;
+}
+
 
 static void update_pic_zone_label(void)
 {
@@ -342,6 +355,8 @@ static void preview_free_cache(void)
 
 static void preview_cache_download_task(void *arg)
 {
+    // Delay 500ms to let K230 server settle after upload_test request
+    vTaskDelay(pdMS_TO_TICKS(500));
     ESP_LOGI(TAG, "Pre-downloading all preview images...");
     preview_zone_count = 0;
     // Download order: Z1, Z2, Z3, Bottom(0)
@@ -350,7 +365,15 @@ static void preview_cache_download_task(void *arg)
         int zone = zone_order[i];
         uint8_t *jpeg_data = NULL;
         size_t jpeg_len = 0;
-        esp_err_t err = k230_client_get_preview_image(zone, 0, &jpeg_data, &jpeg_len);
+        // Retry up to 2 times per zone
+        esp_err_t err = ESP_FAIL;
+        for (int retry = 0; retry < 2 && err != ESP_OK; retry++) {
+            if (retry > 0) {
+                ESP_LOGI(TAG, "Retrying Z%d (%d/2)", zone, retry);
+                vTaskDelay(pdMS_TO_TICKS(200));
+            }
+            err = k230_client_get_preview_image(zone, 0, &jpeg_data, &jpeg_len);
+        }
         if (err == ESP_OK && jpeg_data && jpeg_len > 0) {
             preview_jpeg_cache[zone] = jpeg_data;
             preview_jpeg_cache_len[zone] = jpeg_len;
@@ -464,6 +487,9 @@ static void preview_show_cached_timer_cb(lv_timer_t *timer)
 static void request_preview_load(void)
 {
     if (!preview_mode) return;
+
+    ESP_LOGI(TAG, "request_preview_load: cache_ready=%d, task_handle=%p",
+             preview_cache_ready, (void *)preview_task_handle);
 
     if (preview_cache_ready) {
         // Defer to next LVGL cycle so screen refresh completes first
@@ -899,7 +925,7 @@ static void switch_state(camera_state_t new_state)
         // Keep preview cache alive for cancel-back-to-UPLOAD_READY
         preview_total_h = 0;
         set_upload_progress_animated(5, "Preparing");
-        label_status ? lv_obj_clear_flag(label_status, LV_OBJ_FLAG_HIDDEN), lv_label_set_text(label_status, "Uploading") : (void)0;
+        label_status ? lv_obj_clear_flag(label_status, LV_OBJ_FLAG_HIDDEN), lv_label_set_text(label_status, "Upload") : (void)0;
         lv_label_set_text(label_start, "Wait");
         set_btn_disabled(btn_start, COLOR_GRAY);
         set_btn_disabled(btn_up, COLOR_GRAY);
@@ -911,9 +937,8 @@ static void switch_state(camera_state_t new_state)
 
     case STATE_UPLOAD_FAILED:
         preview_mode = false;
-        preview_free_cache();
         preview_total_h = 0;
-        label_status ? lv_obj_clear_flag(label_status, LV_OBJ_FLAG_HIDDEN), lv_label_set_text(label_status, "Upload Fail") : (void)0;
+        label_status ? lv_obj_clear_flag(label_status, LV_OBJ_FLAG_HIDDEN), lv_label_set_text(label_status, "Up Fail") : (void)0;
         lv_label_set_text(label_start, "Upload");
         set_btn_style(btn_start, COLOR_ORANGE, true);
         set_btn_disabled(btn_up, COLOR_GRAY);
@@ -925,7 +950,6 @@ static void switch_state(camera_state_t new_state)
 
     case STATE_MODEL_DONE:
         preview_mode = false;
-        preview_free_cache();
         preview_total_h = 0;
         set_upload_progress_animated(100, "Done");
         label_status ? lv_obj_clear_flag(label_status, LV_OBJ_FLAG_HIDDEN), lv_label_set_text(label_status, "Done") : (void)0;
@@ -1139,7 +1163,7 @@ static void process_uart_message(const char *clean)
     } else if (strncmp(clean, "MODEL_ERROR", 11) == 0) {
         if (upload_cancelled) return;
         ui_camera_heartbeat();
-        request_label_update("Upload Fail");
+        request_label_update("Up Fail");
         request_state_change(STATE_UPLOAD_FAILED);
     } else if (strcmp(clean, "ALL_DONE") == 0 || strcmp(clean, "CANCELLED") == 0) {
         ui_camera_heartbeat();
@@ -1778,26 +1802,22 @@ void ui_camera_create(void)
 
         // 重置后台模式
         bg_keepalive_mode = false;
+        ui_home_set_camera_keepalive(false);
 
         // Upload Test模式：停止视频流，直接进入上传等待状态
         if (developer_mode_is_upload_test()) {
-            ESP_LOGI(TAG, "Upload Test enabled in background resume: stopping stream");
+            ESP_LOGI(TAG, "Upload Test resume: stopping stream, using existing cache");
             k230_client_force_stop_stream();
-            vTaskDelay(pdMS_TO_TICKS(300));
+            upload_cancelled = false;  // 重置，允许后续真正上传
 
             if (screen_camera) {
                 lv_scr_load(screen_camera);
             }
 
-            esp_err_t err = k230_client_start_upload_test();
-            if (err == ESP_OK) {
-                first_frame_received = true;
-                request_label_update("Upload");
-                request_state_change(STATE_UPLOAD_READY);
-            } else {
-                ESP_LOGE(TAG, "Upload Test request failed: %s", esp_err_to_name(err));
-                request_state_change(STATE_CONN_FAILED);
-            }
+            // 直接切换到 UPLOAD_READY，使用已有缓存（不再发 HTTP 请求给 K230）
+            first_frame_received = true;
+            request_label_update("Upload");
+            request_state_change(STATE_UPLOAD_READY);
             return;
         }
 
@@ -2150,7 +2170,7 @@ void ui_camera_handle_k230_status(const char *status_str)
         request_label_update("Upload");
         request_state_change(STATE_UPLOAD_READY);
     } else if (strncmp(status_str, "MODEL_ERROR", 11) == 0) {
-        request_label_update("Upload Fail");
+        request_label_update("Up Fail");
         request_state_change(STATE_UPLOAD_FAILED);
     }
 }
@@ -2178,6 +2198,7 @@ static void delayed_disconnect_callback(void *arg)
 
     // 真正断开连接
     bg_keepalive_mode = false;
+    request_keepalive_icon_update(false);
     k230_connected = false;
 
     // 停止UART接收
@@ -2249,6 +2270,7 @@ void ui_camera_cancel_delayed_disconnect(void)
 
     // 重置后台模式标志
     bg_keepalive_mode = false;
+    ui_home_set_camera_keepalive(false);
 
     // 恢复frame callback
     k230_client_set_frame_callback(video_frame_callback);
@@ -2274,6 +2296,9 @@ static void start_delayed_disconnect(void)
     // 清空frame callback，停止UI更新（但保持连接）
     k230_client_set_frame_callback(NULL);
 
+    // 忽略后续上传相关UART消息，防止 MODEL_ERROR/MODEL_DONE 清空 preview cache
+    upload_cancelled = true;
+
     // 停止状态检测定时器（节省资源）
     if (detect_timer) {
         esp_timer_stop(detect_timer);
@@ -2293,6 +2318,7 @@ static void start_delayed_disconnect(void)
 
     // 切换到主页面
     lv_scr_load(ui_home_get_screen());
+    ui_home_set_camera_keepalive(true);
 }
 
 /**

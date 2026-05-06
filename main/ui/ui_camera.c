@@ -480,6 +480,8 @@ static void preview_show_cached_timer_cb(lv_timer_t *timer)
 {
     lv_timer_del(timer);
     if (preview_mode && preview_cache_ready) {
+        update_pic_zone_label();
+        if (label_pic_zone) lv_obj_clear_flag(label_pic_zone, LV_OBJ_FLAG_HIDDEN);
         preview_show_cached_zone(preview_zone);
     }
 }

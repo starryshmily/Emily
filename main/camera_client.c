@@ -10,6 +10,7 @@
 #include "esp_http_client.h"
 #include "esp_timer.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
@@ -735,28 +736,37 @@ esp_err_t k230_client_get_preview_image(int zone, int offset_y, uint8_t **data, 
     char url[160];
     snprintf(url, sizeof(url), "http://%s:%d/api/preview?zone=%d&offset=%d",
              g_config.host, g_config.http_port, zone, offset_y);
+    ESP_LOGI(TAG, "Preview request: zone=%d offset=%d url=%s heap=%lu",
+             zone, offset_y, url, (unsigned long)esp_get_free_heap_size());
 
     esp_http_client_config_t http_cfg = {
         .url = url,
         .method = HTTP_METHOD_GET,
         .timeout_ms = 10000,
-        .buffer_size = 2048,
+        .buffer_size = 1024,
+        .buffer_size_tx = 512,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
     if (!client) {
+        ESP_LOGE(TAG, "Preview client init failed: zone=%d", zone);
         return ESP_FAIL;
     }
 
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Preview open failed: zone=%d err=%s", zone, esp_err_to_name(err));
         esp_http_client_cleanup(client);
         return err;
     }
 
     int content_len = esp_http_client_fetch_headers(client);
+    int status_code = esp_http_client_get_status_code(client);
+    ESP_LOGI(TAG, "Preview headers: zone=%d status=%d content_len=%d heap=%lu",
+             zone, status_code, content_len, (unsigned long)esp_get_free_heap_size());
     if (content_len <= 0 || content_len > 150 * 1024) {
-        ESP_LOGW(TAG, "Preview image unsupported size: %d", content_len);
+        ESP_LOGW(TAG, "Preview image unsupported: zone=%d status=%d size=%d",
+                 zone, status_code, content_len);
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
         return ESP_FAIL;
@@ -764,17 +774,30 @@ esp_err_t k230_client_get_preview_image(int zone, int offset_y, uint8_t **data, 
 
     uint8_t *buf = malloc(content_len);
     if (!buf) {
+        ESP_LOGE(TAG, "Preview malloc failed: zone=%d size=%d heap=%lu",
+                 zone, content_len, (unsigned long)esp_get_free_heap_size());
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
         return ESP_ERR_NO_MEM;
     }
+    ESP_LOGI(TAG, "Preview malloc ok: zone=%d size=%d heap=%lu",
+             zone, content_len, (unsigned long)esp_get_free_heap_size());
 
     int total = 0;
+    int zero_reads = 0;
     while (total < content_len) {
         int read_len = esp_http_client_read(client, (char *)buf + total, content_len - total);
         if (read_len <= 0) {
-            break;
+            zero_reads++;
+            ESP_LOGW(TAG, "Preview read wait: zone=%d read=%d total=%d/%d retry=%d",
+                     zone, read_len, total, content_len, zero_reads);
+            if (zero_reads >= 5) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
         }
+        zero_reads = 0;
         total += read_len;
     }
 
@@ -783,12 +806,15 @@ esp_err_t k230_client_get_preview_image(int zone, int offset_y, uint8_t **data, 
 
     if (total != content_len) {
         free(buf);
-        ESP_LOGW(TAG, "Preview read incomplete: %d/%d", total, content_len);
+        ESP_LOGW(TAG, "Preview read incomplete: zone=%d total=%d/%d heap=%lu",
+                 zone, total, content_len, (unsigned long)esp_get_free_heap_size());
         return ESP_FAIL;
     }
 
     *data = buf;
     *len = (size_t)total;
+    ESP_LOGI(TAG, "Preview read ok: zone=%d bytes=%d heap=%lu",
+             zone, total, (unsigned long)esp_get_free_heap_size());
     return ESP_OK;
 }
 

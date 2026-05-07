@@ -24,6 +24,7 @@
 #include "lvgl.h"
 #include "myi2c.h"
 #include "ui_home.h"
+#include "log_store.h"
 // #include "gui_guider.h"
 // #include "lv_demos.h"
 
@@ -39,7 +40,7 @@
 #include "esp_lcd_touch_ft5x06.h"
 #endif
 
-static const char *TAG = "example";
+static const char *TAG = "control_os";
 
 // Using SPI2 in the example
 #define LCD_HOST  SPI2_HOST
@@ -585,6 +586,8 @@ static void example_increase_lvgl_tick(void *arg)
 
 void app_main(void)
 {
+    log_store_init();
+
     ESP_ERROR_CHECK(i2c_master_init());
     ESP_LOGI(TAG, "I2C initialized successfully");
 

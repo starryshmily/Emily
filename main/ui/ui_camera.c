@@ -134,6 +134,9 @@ static int preview_zone_count = 0;                // number of available zones
 static int preview_zone_index = 0;                // current index into preview_zone_list
 
 static TaskHandle_t preview_task_handle = NULL;
+static lv_timer_t *preview_show_timer = NULL;
+static int preview_displayed_zone = -1;
+static int preview_displayed_offset_y = -1;
 static float height_before_calib = 0.0f;  // 校准前的高度（用于校准模式取消）
 
 // K230断开检测
@@ -162,6 +165,7 @@ static void start_delayed_disconnect(void);  // 延迟断开（后台保活）
 bool ui_camera_is_in_background(void);  // 后台保活模式检查
 static void request_preview_load(void);
 static void cleanup_camera_page_resources(void);
+static void release_camera_screen_for_background(void);
 static void upload_start_task(void *arg);
 static void show_upload_progress(bool show);
 static void set_upload_progress_animated(int percent, const char *stage);
@@ -351,6 +355,89 @@ static void preview_free_cache(void)
     preview_cache_ready = false;
     preview_zone_count = 0;
     preview_zone_index = 0;
+    preview_displayed_zone = -1;
+    preview_displayed_offset_y = -1;
+    if (preview_show_timer) {
+        lv_timer_del(preview_show_timer);
+        preview_show_timer = NULL;
+    }
+}
+
+static void preview_invalidate_display(void)
+{
+    preview_displayed_zone = -1;
+    preview_displayed_offset_y = -1;
+    if (preview_show_timer) {
+        lv_timer_del(preview_show_timer);
+        preview_show_timer = NULL;
+    }
+}
+
+static void release_camera_screen_for_background(void)
+{
+    ESP_LOGI(TAG, "Releasing camera UI for background keepalive");
+
+    camera_page_active = false;
+
+    if (preview_show_timer) {
+        lv_timer_del(preview_show_timer);
+        preview_show_timer = NULL;
+    }
+    if (deferred_timer) {
+        lv_timer_del(deferred_timer);
+        deferred_timer = NULL;
+    }
+
+    if (detect_timer) {
+        esp_timer_stop(detect_timer);
+        esp_timer_delete(detect_timer);
+        detect_timer = NULL;
+    }
+    if (force_stop_timer) {
+        esp_timer_stop(force_stop_timer);
+        esp_timer_delete(force_stop_timer);
+        force_stop_timer = NULL;
+    }
+    if (slider_move_timer) {
+        esp_timer_stop(slider_move_timer);
+        esp_timer_delete(slider_move_timer);
+        slider_move_timer = NULL;
+    }
+
+    if (video_mutex) {
+        vSemaphoreDelete(video_mutex);
+        video_mutex = NULL;
+    }
+    if (lcd_draw_mutex) {
+        vSemaphoreDelete(lcd_draw_mutex);
+        lcd_draw_mutex = NULL;
+    }
+
+    if (screen_camera) {
+        lv_obj_t *old_screen = screen_camera;
+        screen_camera = NULL;
+        lv_obj_del_async(old_screen);
+    }
+
+    label_status = NULL;
+    label_height = NULL;
+    btn_back = NULL;
+    btn_start = NULL;
+    label_start = NULL;
+    btn_cancel = NULL;
+    btn_up = NULL;
+    btn_down = NULL;
+    btn_zero = NULL;
+    btn_calibrate = NULL;
+    label_calibrate = NULL;
+    label_pic_zone = NULL;
+    upload_panel = NULL;
+    upload_arc = NULL;
+    upload_percent_label = NULL;
+    upload_stage_label = NULL;
+
+    preview_displayed_zone = -1;
+    preview_displayed_offset_y = -1;
 }
 
 static void preview_cache_download_task(void *arg)
@@ -363,6 +450,10 @@ static void preview_cache_download_task(void *arg)
     static const int zone_order[] = {1, 2, 3, 0};
     for (int i = 0; i < 4; i++) {
         int zone = zone_order[i];
+        // Small delay between downloads to let previous TCP connection fully close
+        if (i > 0) {
+            vTaskDelay(pdMS_TO_TICKS(300));
+        }
         uint8_t *jpeg_data = NULL;
         size_t jpeg_len = 0;
         // Retry up to 2 times per zone
@@ -372,7 +463,12 @@ static void preview_cache_download_task(void *arg)
                 ESP_LOGI(TAG, "Retrying Z%d (%d/2)", zone, retry);
                 vTaskDelay(pdMS_TO_TICKS(200));
             }
+            ESP_LOGI(TAG, "Preview download Z%d start, heap=%lu",
+                     zone, (unsigned long)esp_get_free_heap_size());
             err = k230_client_get_preview_image(zone, 0, &jpeg_data, &jpeg_len);
+            ESP_LOGI(TAG, "Preview download Z%d result=%s len=%u heap=%lu",
+                     zone, esp_err_to_name(err), (unsigned)jpeg_len,
+                     (unsigned long)esp_get_free_heap_size());
         }
         if (err == ESP_OK && jpeg_data && jpeg_len > 0) {
             preview_jpeg_cache[zone] = jpeg_data;
@@ -382,7 +478,7 @@ static void preview_cache_download_task(void *arg)
             ESP_LOGI(TAG, "Cached Z%d: %u bytes", zone, (unsigned)jpeg_len);
         } else {
             preview_zone_available[zone] = false;
-            ESP_LOGI(TAG, "Z%d not available", zone);
+            ESP_LOGI(TAG, "Z%d not available: %s", zone, esp_err_to_name(err));
             if (jpeg_data) free(jpeg_data);
         }
     }
@@ -471,6 +567,8 @@ static void preview_show_cached_zone(int zone)
                                 VIDEO_POS_X + VIDEO_W, VIDEO_POS_Y + VIDEO_H,
                                 video_buffer);
             xSemaphoreGiveRecursive(lcd_draw_mutex);
+            preview_displayed_zone = zone;
+            preview_displayed_offset_y = preview_offset_y;
         }
     }
     xSemaphoreGive(video_mutex);
@@ -479,6 +577,9 @@ static void preview_show_cached_zone(int zone)
 static void preview_show_cached_timer_cb(lv_timer_t *timer)
 {
     lv_timer_del(timer);
+    if (preview_show_timer == timer) {
+        preview_show_timer = NULL;
+    }
     if (preview_mode && preview_cache_ready) {
         update_pic_zone_label();
         if (label_pic_zone) lv_obj_clear_flag(label_pic_zone, LV_OBJ_FLAG_HIDDEN);
@@ -494,15 +595,24 @@ static void request_preview_load(void)
              preview_cache_ready, (void *)preview_task_handle);
 
     if (preview_cache_ready) {
+        if (preview_displayed_zone == preview_zone &&
+            preview_displayed_offset_y == preview_offset_y) {
+            ESP_LOGI(TAG, "Preview already displayed: zone=%d offset=%d", preview_zone, preview_offset_y);
+            return;
+        }
+        if (preview_show_timer) {
+            ESP_LOGI(TAG, "Preview show already pending: zone=%d offset=%d", preview_zone, preview_offset_y);
+            return;
+        }
         // Defer to next LVGL cycle so screen refresh completes first
-        lv_timer_t *t = lv_timer_create(preview_show_cached_timer_cb, 50, NULL);
-        lv_timer_set_repeat_count(t, 1);
+        preview_show_timer = lv_timer_create(preview_show_cached_timer_cb, 50, NULL);
+        lv_timer_set_repeat_count(preview_show_timer, 1);
         return;
     }
 
     // Cache not ready yet, start download task
     if (preview_task_handle) return;
-    xTaskCreate(preview_cache_download_task, "preview_img", 4096, NULL, 4, &preview_task_handle);
+    xTaskCreate(preview_cache_download_task, "preview_img", 3072, NULL, 4, &preview_task_handle);
 }
 
 static void preview_gesture_callback(lv_event_t *e)
@@ -518,6 +628,8 @@ static void preview_gesture_callback(lv_event_t *e)
         if (preview_zone_index >= preview_zone_count) preview_zone_index = 0;
         preview_zone = preview_zone_list[preview_zone_index];
         preview_offset_y = 0;
+        preview_displayed_zone = -1;
+        preview_displayed_offset_y = -1;
         update_pic_zone_label();
         request_preview_load();
     } else if (dir == LV_DIR_RIGHT) {
@@ -526,6 +638,8 @@ static void preview_gesture_callback(lv_event_t *e)
         if (preview_zone_index < 0) preview_zone_index = preview_zone_count - 1;
         preview_zone = preview_zone_list[preview_zone_index];
         preview_offset_y = 0;
+        preview_displayed_zone = -1;
+        preview_displayed_offset_y = -1;
         update_pic_zone_label();
         request_preview_load();
     } else if (dir == LV_DIR_TOP) {
@@ -535,6 +649,7 @@ static void preview_gesture_callback(lv_event_t *e)
             if (preview_offset_y > preview_total_h - VIDEO_H) {
                 preview_offset_y = preview_total_h - VIDEO_H;
             }
+            preview_displayed_offset_y = -1;
             request_preview_load();
         }
     } else if (dir == LV_DIR_BOTTOM) {
@@ -542,6 +657,7 @@ static void preview_gesture_callback(lv_event_t *e)
         if (preview_total_h > VIDEO_H && preview_offset_y > 0) {
             preview_offset_y -= 120;
             if (preview_offset_y < 0) preview_offset_y = 0;
+            preview_displayed_offset_y = -1;
             request_preview_load();
         }
     }
@@ -1510,7 +1626,7 @@ static void btn_back_callback(lv_event_t *e)
     if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
         // 如果已经连接且有视频流，进入后台保活模式（30秒后才真正断开）
         if (k230_connected && current_state >= STATE_IDLE) {
-            ESP_LOGI(TAG, "Back clicked: entering background keepalive mode (10s delay)");
+            ESP_LOGI(TAG, "Back clicked: entering background keepalive mode (30s delay)");
             start_delayed_disconnect();
             return;
         }
@@ -1790,11 +1906,15 @@ static void btn_calibrate_callback(lv_event_t *e)
 void ui_camera_create(void)
 {
     ESP_LOGI(TAG, "Free heap at page create: %lu bytes", (unsigned long)esp_get_free_heap_size());
+    bool resume_from_background = false;
+    camera_state_t resume_state = current_state;
 
     // 如果处于后台保活模式（30秒内点击返回），恢复连接而不是重新创建
     // 注意：必须在删除旧屏幕之前检查，否则会丢失screen_camera引用
     if (ui_camera_is_in_background()) {
         ESP_LOGI(TAG, "Resuming from background keepalive mode...");
+        resume_from_background = true;
+        resume_state = current_state;
         camera_page_active = true;
 
         // 先停止延迟断开定时器
@@ -1814,25 +1934,42 @@ void ui_camera_create(void)
 
             if (screen_camera) {
                 lv_scr_load(screen_camera);
+                preview_invalidate_display();
+            }
+            if (!screen_camera) {
+                resume_state = STATE_UPLOAD_READY;
             }
 
             // 直接切换到 UPLOAD_READY，使用已有缓存（不再发 HTTP 请求给 K230）
             first_frame_received = true;
-            request_label_update("Upload");
-            request_state_change(STATE_UPLOAD_READY);
-            return;
+            if (screen_camera) {
+                request_label_update("Upload");
+                request_state_change(STATE_UPLOAD_READY);
+                if (preview_mode && preview_cache_ready) {
+                    request_preview_load();
+                }
+            }
+            if (screen_camera) {
+                return;
+            }
         }
 
         // 恢复frame callback
-        k230_client_set_frame_callback(video_frame_callback);
+        if (!developer_mode_is_upload_test()) {
+            k230_client_set_frame_callback(video_frame_callback);
+        }
 
         // 如果已有屏幕，直接加载
         if (screen_camera) {
             lv_scr_load(screen_camera);
+            preview_invalidate_display();
+            if (preview_mode && preview_cache_ready) {
+                request_preview_load();
+            }
             return;
         }
         // 如果screen不存在（异常情况），清理旧资源后继续正常创建流程
-        ESP_LOGW(TAG, "Screen missing in bg mode, cleaning up and recreating...");
+        ESP_LOGI(TAG, "Camera UI was released in background, recreating UI only");
         // 先清理旧的mutex和定时器，防止重复创建导致内存泄漏
         if (video_mutex) { vSemaphoreDelete(video_mutex); video_mutex = NULL; }
         if (lcd_draw_mutex) { vSemaphoreDelete(lcd_draw_mutex); lcd_draw_mutex = NULL; }
@@ -1848,7 +1985,7 @@ void ui_camera_create(void)
 
     screen_camera = lv_obj_create(NULL);
     lv_obj_set_size(screen_camera, 240, 320);
-    lv_obj_set_scrollbar_mode(screen_camera, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(screen_camera, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(screen_camera, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(screen_camera, LV_OPA_COVER, 0);
 
@@ -2099,11 +2236,21 @@ void ui_camera_create(void)
     lv_obj_set_pos(upload_stage_label, VIDEO_POS_X + 6, VIDEO_POS_Y + 188);
     lv_obj_add_flag(upload_stage_label, LV_OBJ_FLAG_HIDDEN);
 
-    switch_state(STATE_CONNECTING);
     update_height_label();
     lv_scr_load(screen_camera);
 
+    if (resume_from_background && k230_connected) {
+        first_frame_received = true;
+        switch_state(resume_state);
+        if (preview_mode && preview_cache_ready) {
+            request_preview_load();
+        }
+        ESP_LOGI(TAG, "Camera UI recreated from background cache, no reconnect");
+        return;
+    }
+
     // 异步连接K230 (不修改原有连接逻辑)
+    switch_state(STATE_CONNECTING);
     ESP_LOGI(TAG, "Free heap before k230_conn task: %lu bytes", (unsigned long)esp_get_free_heap_size());
     if (!k230_connect_task_handle) {
         BaseType_t ret = xTaskCreate(k230_connect_task, "k230_conn", 4096, NULL, 5, &k230_connect_task_handle);
@@ -2196,7 +2343,7 @@ static void delayed_disconnect_callback(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG, "Delayed disconnect: performing actual K230 disconnect after 10s");
+    ESP_LOGI(TAG, "Delayed disconnect: performing actual K230 disconnect after 30s");
 
     // 真正断开连接
     bg_keepalive_mode = false;
@@ -2250,6 +2397,19 @@ static void delayed_disconnect_callback(void *arg)
         lv_obj_del_async(old_screen);
     }
 
+    if (slider_move_timer) {
+        esp_timer_delete(slider_move_timer);
+        slider_move_timer = NULL;
+    }
+    if (deferred_timer) {
+        lv_timer_del(deferred_timer);
+        deferred_timer = NULL;
+    }
+
+    preview_free_cache();
+    preview_total_h = 0;
+    preview_offset_y = 0;
+
     ESP_LOGI(TAG, "Delayed disconnect complete");
 }
 
@@ -2293,7 +2453,7 @@ static void start_delayed_disconnect(void)
     // 标记后台模式
     bg_keepalive_mode = true;
 
-    ESP_LOGI(TAG, "Starting delayed disconnect: keeping connection for 10s...");
+    ESP_LOGI(TAG, "Starting delayed disconnect: keeping connection for 30s...");
 
     // 清空frame callback，停止UI更新（但保持连接）
     k230_client_set_frame_callback(NULL);
@@ -2321,6 +2481,7 @@ static void start_delayed_disconnect(void)
     // 切换到主页面
     lv_scr_load(ui_home_get_screen());
     ui_home_set_camera_keepalive(true);
+    release_camera_screen_for_background();
 }
 
 /**

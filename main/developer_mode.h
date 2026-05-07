@@ -13,6 +13,10 @@ bool developer_mode_is_history_test(void);
 
 void developer_mode_set_uart_test(bool enabled);
 bool developer_mode_is_uart_test(void);
+
+void developer_mode_set_log_test(bool enabled);
+bool developer_mode_is_log_test(void);
+
 bool developer_mode_any_enabled(void);
 
 #endif // DEVELOPER_MODE_H

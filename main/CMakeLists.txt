@@ -18,6 +18,7 @@ file(GLOB_RECURSE srcs *.c
 list(APPEND srcs
     developer_mode.c
     history_store.c
+    log_store.c
     ui/ui_developer.c
     ui/ui_history.c
     )

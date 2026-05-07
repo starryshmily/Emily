@@ -1,4 +1,5 @@
 #include "developer_mode.h"
+#include "log_store.h"
 #include "nvs.h"
 #include "esp_log.h"
 
@@ -8,6 +9,7 @@ static const char *NVS_NS = "dev_mode";
 static bool upload_test_enabled = false;
 static bool history_test_enabled = false;
 static bool uart_test_enabled = false;
+static bool log_test_enabled = false;
 static bool developer_mode_loaded = false;
 
 static void developer_mode_save_u8(const char *key, bool enabled)
@@ -55,10 +57,12 @@ esp_err_t developer_mode_init(void)
     upload_test_enabled = developer_mode_load_u8(nvs, "upload", false);
     history_test_enabled = developer_mode_load_u8(nvs, "history", false);
     uart_test_enabled = developer_mode_load_u8(nvs, "uart", false);
+    log_test_enabled = developer_mode_load_u8(nvs, "log", false);
+    log_store_enable(log_test_enabled);
     developer_mode_loaded = true;
 
-    ESP_LOGI(TAG, "loaded: upload=%d history=%d uart=%d",
-             upload_test_enabled, history_test_enabled, uart_test_enabled);
+    ESP_LOGI(TAG, "loaded: upload=%d history=%d uart=%d log=%d",
+             upload_test_enabled, history_test_enabled, uart_test_enabled, log_test_enabled);
     nvs_close(nvs);
     return ESP_OK;
 }
@@ -102,8 +106,22 @@ bool developer_mode_is_uart_test(void)
     return uart_test_enabled;
 }
 
+void developer_mode_set_log_test(bool enabled)
+{
+    developer_mode_init();
+    log_test_enabled = enabled;
+    log_store_enable(enabled);
+    developer_mode_save_u8("log", enabled);
+}
+
+bool developer_mode_is_log_test(void)
+{
+    developer_mode_init();
+    return log_test_enabled;
+}
+
 bool developer_mode_any_enabled(void)
 {
     developer_mode_init();
-    return upload_test_enabled || history_test_enabled || uart_test_enabled;
+    return upload_test_enabled || history_test_enabled || uart_test_enabled || log_test_enabled;
 }

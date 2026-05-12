@@ -86,6 +86,12 @@ esp_err_t k230_client_get_preview_image(int zone, int offset_y, uint8_t **data, 
 bool k230_client_is_connected(void);
 
 /**
+ * @brief 获取MJPEG视频流任务是否仍在运行
+ * @return true if stream task is running
+ */
+bool k230_client_is_stream_running(void);
+
+/**
  * @brief 设置视频帧回调函数
  * @param callback 帧回调函数
  */

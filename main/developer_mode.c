@@ -9,6 +9,9 @@ static const char *NVS_NS = "dev_mode";
 static bool upload_test_enabled = false;
 static bool history_test_enabled = false;
 static bool uart_test_enabled = false;
+static bool camera_test_enabled = false;
+static bool motor_test_enabled = false;
+static bool ws2812_test_enabled = false;
 static bool log_test_enabled = false;
 static bool developer_mode_loaded = false;
 
@@ -57,12 +60,16 @@ esp_err_t developer_mode_init(void)
     upload_test_enabled = developer_mode_load_u8(nvs, "upload", false);
     history_test_enabled = developer_mode_load_u8(nvs, "history", false);
     uart_test_enabled = developer_mode_load_u8(nvs, "uart", false);
+    camera_test_enabled = developer_mode_load_u8(nvs, "camera", false);
+    motor_test_enabled = developer_mode_load_u8(nvs, "motor", false);
+    ws2812_test_enabled = developer_mode_load_u8(nvs, "ws2812", false);
     log_test_enabled = developer_mode_load_u8(nvs, "log", false);
     log_store_enable(log_test_enabled);
     developer_mode_loaded = true;
 
-    ESP_LOGI(TAG, "loaded: upload=%d history=%d uart=%d log=%d",
-             upload_test_enabled, history_test_enabled, uart_test_enabled, log_test_enabled);
+    ESP_LOGI(TAG, "loaded: upload=%d history=%d uart=%d camera=%d motor=%d ws2812=%d log=%d",
+             upload_test_enabled, history_test_enabled, uart_test_enabled,
+             camera_test_enabled, motor_test_enabled, ws2812_test_enabled, log_test_enabled);
     nvs_close(nvs);
     return ESP_OK;
 }
@@ -106,6 +113,45 @@ bool developer_mode_is_uart_test(void)
     return uart_test_enabled;
 }
 
+void developer_mode_set_camera_test(bool enabled)
+{
+    developer_mode_init();
+    camera_test_enabled = enabled;
+    developer_mode_save_u8("camera", enabled);
+}
+
+bool developer_mode_is_camera_test(void)
+{
+    developer_mode_init();
+    return camera_test_enabled;
+}
+
+void developer_mode_set_motor_test(bool enabled)
+{
+    developer_mode_init();
+    motor_test_enabled = enabled;
+    developer_mode_save_u8("motor", enabled);
+}
+
+bool developer_mode_is_motor_test(void)
+{
+    developer_mode_init();
+    return motor_test_enabled;
+}
+
+void developer_mode_set_ws2812_test(bool enabled)
+{
+    developer_mode_init();
+    ws2812_test_enabled = enabled;
+    developer_mode_save_u8("ws2812", enabled);
+}
+
+bool developer_mode_is_ws2812_test(void)
+{
+    developer_mode_init();
+    return ws2812_test_enabled;
+}
+
 void developer_mode_set_log_test(bool enabled)
 {
     developer_mode_init();
@@ -123,5 +169,6 @@ bool developer_mode_is_log_test(void)
 bool developer_mode_any_enabled(void)
 {
     developer_mode_init();
-    return upload_test_enabled || history_test_enabled || uart_test_enabled || log_test_enabled;
+    return upload_test_enabled || history_test_enabled || uart_test_enabled ||
+           camera_test_enabled || motor_test_enabled || ws2812_test_enabled || log_test_enabled;
 }

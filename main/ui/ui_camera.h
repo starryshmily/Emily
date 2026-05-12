@@ -87,6 +87,12 @@ bool ui_camera_is_in_background(void);
  */
 void ui_camera_cancel_delayed_disconnect(void);
 
+/**
+ * @brief 发送WS2812氛围灯模式（公开接口，供其他页面调用）
+ * @param mode 模式名: "IDLE", "CONNECTING", "SCAN", "UPLOAD", "SUCCESS", "ERROR"
+ */
+void ui_ws2812_set_mode(const char *mode);
+
 #ifdef __cplusplus
 }
 #endif

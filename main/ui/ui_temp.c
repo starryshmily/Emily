@@ -6,6 +6,7 @@
 #include "lvgl.h"
 #include "ui_temp.h"
 #include "ui_home.h"
+#include "ui_camera.h"  // 用于WS2812氛围灯控制
 #include "gxhtc3.h"
 #include <stdio.h>
 
@@ -95,6 +96,7 @@ static void btn_back_callback(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
     if(code == LV_EVENT_CLICKED) {
+        ui_ws2812_set_mode("IDLE");
         lv_scr_load(ui_home_get_screen());
         ui_temp_destroy();
     }
@@ -340,6 +342,9 @@ static void ui_temp_create_internal(float initial_temp, float initial_humi)
 
     // 定时器 - 每500ms读取温湿度
     temp_timer = lv_timer_create(temp_read_timer_cb, 500, NULL);
+
+    // 进入温湿度页面，氛围灯设为彩虹固定
+    ui_ws2812_set_mode("SCAN");
 
     lv_scr_load(screen_temp);
 }

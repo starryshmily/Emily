@@ -823,6 +823,11 @@ bool k230_client_is_connected(void)
     return g_is_connected;
 }
 
+bool k230_client_is_stream_running(void)
+{
+    return g_stream_running;
+}
+
 void k230_client_set_frame_callback(frame_callback_t callback)
 {
     g_frame_callback = callback;

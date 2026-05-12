@@ -50,8 +50,8 @@ static const char *TAG = "ui_camera";
 #define POS_FAIL_DELAY_MS  2000
 
 // 滑块参数
-#define SLIDER_MAX_HEIGHT_MM  200.0f
-#define SLIDER_UP_LIMIT_MM    200.0f  // 20cm时UP按钮禁用（19cm仍可UP）
+#define SLIDER_MAX_HEIGHT_MM  180.0f
+#define SLIDER_UP_LIMIT_MM    180.0f  // 18cm时UP按钮禁用（17cm仍可UP）
 #define SLIDER_DOWN_LIMIT_MM  10.0f   // 距底<10mm时DOWN不可点
 #define SLIDER_MOVE_MM       10.0f    // 每次移动10mm
 
@@ -313,6 +313,73 @@ static void request_state_change(camera_state_t new_state)
     has_pending_state = true;
 }
 
+// 返回主页后灯效锁定，禁止UART/断连等事件改变氛围灯
+static volatile bool ws2812_home_locked = false;
+
+static void ws2812_send_mode(const char *mode)
+{
+    if (!mode) return;
+    if (ws2812_home_locked) return;
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "WS2812:%s", mode);
+    c3_uart_send(cmd);
+}
+
+void ui_ws2812_set_mode(const char *mode)
+{
+    if (!mode) return;
+    ws2812_home_locked = false;  // 外部调用时解锁
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "WS2812:%s", mode);
+    c3_uart_send(cmd);
+    ws2812_home_locked = true;   // 发完重新锁定
+}
+
+static void ws2812_apply_for_state(camera_state_t state)
+{
+    if (ws2812_home_locked) return;
+
+    switch (state) {
+    case STATE_CONNECTING:
+        ws2812_send_mode("CONNECTING");
+        break;
+    case STATE_CONN_FAILED:
+    case STATE_POS_FAILED:
+    case STATE_LIMIT_FAILED:
+    case STATE_UPLOAD_FAILED:
+        ws2812_send_mode("ERROR");
+        break;
+    case STATE_CAPTURING:
+        ws2812_send_mode("SCAN");
+        break;
+    case STATE_UPLOADING:
+        ws2812_send_mode("UPLOAD");
+        break;
+    case STATE_MODEL_DONE:
+        ws2812_send_mode("SUCCESS");
+        break;
+    case STATE_IDLE:
+        // 连接成功后绿色长亮，未连接时浅蓝色长亮
+        if (first_frame_received) {
+            ws2812_send_mode("SUCCESS");
+        } else {
+            ws2812_send_mode("IDLE");
+        }
+        break;
+    case STATE_CALIBRATING:
+    case STATE_DETECTING:
+    case STATE_POSITIONING:
+    case STATE_POS_SUCCESS:
+    case STATE_UPLOAD_READY:
+        // scan相关状态，彩虹固定
+        ws2812_send_mode("SCAN");
+        break;
+    default:
+        ws2812_send_mode("IDLE");
+        break;
+    }
+}
+
 static void request_ui_update(void)
 {
     has_pending_ui_update = true;
@@ -438,6 +505,11 @@ static void release_camera_screen_for_background(void)
 
     preview_displayed_zone = -1;
     preview_displayed_offset_y = -1;
+
+    // 清除待处理标志，防止resume时旧deferred_timer触发已删除mutex的操作
+    has_pending_state = false;
+    has_pending_ui_update = false;
+    has_pending_label = false;
 }
 
 static void preview_cache_download_task(void *arg)
@@ -549,7 +621,7 @@ static void preview_show_cached_zone(int zone)
     jpeg_get_dimensions(preview_jpeg_cache[zone], preview_jpeg_cache_len[zone], &img_w, &img_h);
     if (img_w <= 0 || img_h <= 0 || img_w > 300 || img_h > 600) return;
 
-    if (xSemaphoreTake(video_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    if (!video_mutex || xSemaphoreTake(video_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
 
     preview_total_h = img_h;
     memset(video_buffer, 0, VIDEO_W * VIDEO_H * 2);
@@ -562,7 +634,7 @@ static void preview_show_cached_zone(int zone)
         .scale = 0,
     };
     if (jpeg_decode_to_rgb565(preview_jpeg_cache[zone], preview_jpeg_cache_len[zone], &cfg) == ESP_OK) {
-        if (xSemaphoreTakeRecursive(lcd_draw_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        if (lcd_draw_mutex && xSemaphoreTakeRecursive(lcd_draw_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             app_lcd_draw_bitmap(VIDEO_POS_X, VIDEO_POS_Y,
                                 VIDEO_POS_X + VIDEO_W, VIDEO_POS_Y + VIDEO_H,
                                 video_buffer);
@@ -770,6 +842,7 @@ static void handle_model_progress(const char *clean)
 static void handle_k230_disconnect(const char *reason)
 {
     ESP_LOGW(TAG, "K230 disconnected: %s (state was %d)", reason, current_state);
+    ws2812_send_mode("ERROR");
     k230_connected = false;
     if (slider_move_timer) esp_timer_stop(slider_move_timer);
     slider_height_mm = 0;
@@ -881,6 +954,7 @@ static void switch_state(camera_state_t new_state)
     current_state = new_state;
 
     ESP_LOGI(TAG, "State: %d -> %d", old_state, new_state);
+    ws2812_apply_for_state(new_state);
 
     // 获取LCD锁保护所有LVGL操作
     bool locked = (lcd_draw_mutex && xSemaphoreTakeRecursive(lcd_draw_mutex, pdMS_TO_TICKS(100)) == pdTRUE);
@@ -1183,7 +1257,7 @@ static void process_uart_message(const char *clean)
             pending_cancel_capture = false;
             ESP_LOGI(TAG, "Cancel capture: height refreshed (%.1fmm), sending STOP", slider_height_mm);
             c3_uart_send(CMD_STOP);
-            request_state_change(STATE_IDLE);
+            request_state_change(STATE_MODEL_DONE);
             if (force_stop_timer) {
                 esp_timer_start_once(force_stop_timer, 5000000);
             }
@@ -1288,6 +1362,7 @@ static void process_uart_message(const char *clean)
         pending_cancel_capture = false;  // 无论什么情况，清除等待标志
         if (capture_cancelled || strcmp(clean, "CANCELLED") == 0) {
             ESP_LOGI(TAG, "Capture %s, sending HOME to return to zero", clean);
+            ws2812_send_mode("IDLE");
             capture_cancelled = false;
             // ALL_DONE/CANCELLED意味着拍摄线程已结束，直接发HOME归零
             // 注意: 必须从UART线程发HOME（c3_uart_send是线程安全的），
@@ -1332,7 +1407,8 @@ static void process_uart_message(const char *clean)
                 ESP_LOGE(TAG, "Model history save failed: %s", esp_err_to_name(err));
             }
             set_upload_progress_animated(100, "Done");
-            request_state_change(STATE_IDLE);
+            ws2812_send_mode("SUCCESS");
+            request_state_change(STATE_MODEL_DONE);
         } else {
             ESP_LOGW(TAG, "Invalid MODEL_DONE message: %s", clean);
         }
@@ -1360,7 +1436,8 @@ static void process_uart_message(const char *clean)
             ESP_LOGW(TAG, "Invalid MODEL_DONE message: %s", clean);
         }
         set_upload_progress_animated(100, "Done");
-        request_state_change(STATE_IDLE);
+        ws2812_send_mode("SUCCESS");
+        request_state_change(STATE_MODEL_DONE);
     }
 }
 
@@ -1570,7 +1647,7 @@ static void video_frame_callback(const uint8_t *jpeg_data, size_t jpeg_len)
         return;
     }
 
-    if (xSemaphoreTake(video_mutex, pdMS_TO_TICKS(5)) != pdTRUE) {
+    if (!video_mutex || xSemaphoreTake(video_mutex, pdMS_TO_TICKS(5)) != pdTRUE) {
         return;
     }
 
@@ -1586,7 +1663,7 @@ static void video_frame_callback(const uint8_t *jpeg_data, size_t jpeg_len)
     esp_err_t err = jpeg_decode_to_rgb565(jpeg_data, jpeg_len, &cfg);
     if (err == ESP_OK) {
         // 获取LCD互斥锁，防止与UI更新的SPI操作冲突
-        if (xSemaphoreTakeRecursive(lcd_draw_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        if (lcd_draw_mutex && xSemaphoreTakeRecursive(lcd_draw_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             app_lcd_draw_bitmap(
                 VIDEO_POS_X, VIDEO_POS_Y,
                 VIDEO_POS_X + VIDEO_W, VIDEO_POS_Y + VIDEO_H,
@@ -1627,12 +1704,15 @@ static void btn_back_callback(lv_event_t *e)
         // 如果已经连接且有视频流，进入后台保活模式（30秒后才真正断开）
         if (k230_connected && current_state >= STATE_IDLE) {
             ESP_LOGI(TAG, "Back clicked: entering background keepalive mode (30s delay)");
+            ws2812_send_mode("IDLE");
             start_delayed_disconnect();
             return;
         }
 
         // 未连接或正在连接中，立即断开（不需要保活）
         ESP_LOGI(TAG, "Back clicked: immediate cleanup (not in stream mode)");
+        ws2812_send_mode("IDLE");
+        ws2812_home_locked = true;
         camera_page_active = false;
         camera_session_id++;
         lv_scr_load(ui_home_get_screen());
@@ -1710,15 +1790,23 @@ static void btn_start_callback(lv_event_t *e)
         switch_state(STATE_DETECTING);
     } else if (current_state == STATE_POS_SUCCESS || current_state == STATE_LIMIT_FAILED) {
         ESP_LOGI(TAG, "Scan: sending START_SCAN to K230");
+        ws2812_send_mode("SCAN");
+        if (developer_mode_is_motor_test()) {
+            ESP_LOGI(TAG, "Scan: auto turning Motor Test OFF");
+            developer_mode_set_motor_test(false);
+            c3_uart_send("MOTOR_TEST:OFF");
+        }
         capture_cancelled = false;  // 重置取消标志，开始新的扫描
         pending_cancel_capture = false;
         k230_client_start_scan();
     } else if (current_state == STATE_UPLOAD_READY || current_state == STATE_UPLOAD_FAILED) {
         ESP_LOGI(TAG, "Upload: sending UPLOAD to K230");
+        ws2812_send_mode("UPLOAD");
         switch_state(STATE_UPLOADING);
         xTaskCreate(upload_start_task, "upload", 4096, NULL, 4, NULL);
     } else if (current_state == STATE_CONN_FAILED) {
         ESP_LOGI(TAG, "Reconnect: restarting connection to K230");
+        ws2812_send_mode("CONNECTING");
         first_frame_received = false;  // 重置首帧标志，允许新连接触发IDLE切换
         // 停止旧的UART任务
         uart_rx_running = false;
@@ -1765,12 +1853,10 @@ static void btn_cancel_callback(lv_event_t *e)
         switch_state(STATE_IDLE);
     } else if (current_state == STATE_UPLOAD_READY || current_state == STATE_UPLOADING ||
                current_state == STATE_UPLOAD_FAILED || current_state == STATE_MODEL_DONE) {
-        // Cancel upload: go back to preview state (reuse cache if available)
+        // Cancel upload/model flow: return to idle lighting and controls
         upload_cancelled = true;
-        if (!preview_cache_ready) {
-            preview_free_cache();
-        }
-        switch_state(STATE_UPLOAD_READY);
+        preview_free_cache();
+        switch_state(STATE_IDLE);
     } else if (current_state == STATE_CAPTURING) {
         // 拍摄中取消: 不立即发STOP，等当前移动完成(HEIGHT消息)后再发
         // 避免电机中途停下导致高度未刷新，归零不准
@@ -1906,6 +1992,12 @@ static void btn_calibrate_callback(lv_event_t *e)
 void ui_camera_create(void)
 {
     ESP_LOGI(TAG, "Free heap at page create: %lu bytes", (unsigned long)esp_get_free_heap_size());
+    if (developer_mode_is_ws2812_test()) {
+        ESP_LOGI(TAG, "Camera entering: auto exit Developer WS2812 test");
+        developer_mode_set_ws2812_test(false);
+    }
+    ws2812_home_locked = false;  // 进入camera页面，解锁灯效
+    ws2812_send_mode("CONNECTING");
     bool resume_from_background = false;
     camera_state_t resume_state = current_state;
 
@@ -1954,7 +2046,7 @@ void ui_camera_create(void)
             }
         }
 
-        // 恢复frame callback
+        // 恢复frame callback。视频流保活时不重新 start stream，只把帧重新接回 LVGL。
         if (!developer_mode_is_upload_test()) {
             k230_client_set_frame_callback(video_frame_callback);
         }
@@ -1966,6 +2058,14 @@ void ui_camera_create(void)
             if (preview_mode && preview_cache_ready) {
                 request_preview_load();
             }
+            if (!developer_mode_is_upload_test()) {
+                if (k230_client_is_stream_running()) {
+                    ESP_LOGI(TAG, "Resume keepalive: reuse existing stream");
+                } else {
+                    ESP_LOGW(TAG, "Resume keepalive: stream not running, restart stream");
+                    k230_client_start_stream();
+                }
+            }
             return;
         }
         // 如果screen不存在（异常情况），清理旧资源后继续正常创建流程
@@ -1975,6 +2075,10 @@ void ui_camera_create(void)
         if (lcd_draw_mutex) { vSemaphoreDelete(lcd_draw_mutex); lcd_draw_mutex = NULL; }
         if (detect_timer) { esp_timer_delete(detect_timer); detect_timer = NULL; }
         if (force_stop_timer) { esp_timer_delete(force_stop_timer); force_stop_timer = NULL; }
+
+        // 立即创建mutex - frame callback已在上方设置，帧随时可能到达
+        video_mutex = xSemaphoreCreateMutex();
+        lcd_draw_mutex = xSemaphoreCreateRecursiveMutex();
     } else {
         // 正常流程：清理旧屏幕
         if (screen_camera) lv_obj_del(screen_camera);
@@ -1989,8 +2093,12 @@ void ui_camera_create(void)
     lv_obj_set_style_bg_color(screen_camera, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(screen_camera, LV_OPA_COVER, 0);
 
-    video_mutex = xSemaphoreCreateMutex();
-    lcd_draw_mutex = xSemaphoreCreateRecursiveMutex();  // 递归mutex允许同任务重复获取
+    if (!video_mutex) {
+        video_mutex = xSemaphoreCreateMutex();
+    }
+    if (!lcd_draw_mutex) {
+        lcd_draw_mutex = xSemaphoreCreateRecursiveMutex();  // 递归mutex允许同任务重复获取
+    }
 
     // 重置首帧标志 (重新进入页面时必须重新检测)
 
@@ -2245,7 +2353,16 @@ void ui_camera_create(void)
         if (preview_mode && preview_cache_ready) {
             request_preview_load();
         }
-        ESP_LOGI(TAG, "Camera UI recreated from background cache, no reconnect");
+        if (!developer_mode_is_upload_test()) {
+            if (k230_client_is_stream_running()) {
+                ESP_LOGI(TAG, "Camera UI recreated from background cache, reuse existing stream");
+            } else {
+                ESP_LOGW(TAG, "Camera UI recreated but stream not running, restart stream");
+                k230_client_start_stream();
+            }
+        } else {
+            ESP_LOGI(TAG, "Camera UI recreated from background cache, no reconnect");
+        }
         return;
     }
 
@@ -2344,6 +2461,7 @@ static void delayed_disconnect_callback(void *arg)
     }
 
     ESP_LOGI(TAG, "Delayed disconnect: performing actual K230 disconnect after 30s");
+    ws2812_home_locked = true;  // 确保灯效锁定
 
     // 真正断开连接
     bg_keepalive_mode = false;
@@ -2450,6 +2568,8 @@ void ui_camera_cancel_delayed_disconnect(void)
  */
 static void start_delayed_disconnect(void)
 {
+    ws2812_send_mode("IDLE");
+
     // 标记后台模式
     bg_keepalive_mode = true;
 
@@ -2482,6 +2602,9 @@ static void start_delayed_disconnect(void)
     lv_scr_load(ui_home_get_screen());
     ui_home_set_camera_keepalive(true);
     release_camera_screen_for_background();
+
+    // 锁定灯效为浅蓝色，后续任何事件不再改变
+    ws2812_home_locked = true;
 }
 
 /**

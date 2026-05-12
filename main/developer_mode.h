@@ -14,6 +14,15 @@ bool developer_mode_is_history_test(void);
 void developer_mode_set_uart_test(bool enabled);
 bool developer_mode_is_uart_test(void);
 
+void developer_mode_set_camera_test(bool enabled);
+bool developer_mode_is_camera_test(void);
+
+void developer_mode_set_motor_test(bool enabled);
+bool developer_mode_is_motor_test(void);
+
+void developer_mode_set_ws2812_test(bool enabled);
+bool developer_mode_is_ws2812_test(void);
+
 void developer_mode_set_log_test(bool enabled);
 bool developer_mode_is_log_test(void);
 

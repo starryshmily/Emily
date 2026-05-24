@@ -21,6 +21,7 @@ list(APPEND srcs
     log_store.c
     ui/ui_developer.c
     ui/ui_history.c
+    ui/ui_light.c
     )
 
 set(include_dirs

@@ -77,6 +77,7 @@ void k230_client_disconnect(void);
 esp_err_t k230_client_start_scan(void);
 esp_err_t k230_client_start_upload(void);
 esp_err_t k230_client_start_upload_test(void);
+esp_err_t k230_client_start_demo_scan(void);
 esp_err_t k230_client_get_preview_image(int zone, int offset_y, uint8_t **data, size_t *len);
 
 /**
@@ -113,6 +114,11 @@ esp_err_t k230_client_start_stream(void);
  * @brief 停止MJPEG视频流
  */
 void k230_client_stop_stream(void);
+
+/**
+ * @brief 暂停MJPEG视频流 (不断开连接)
+ */
+void k230_client_pause_stream(void);
 
 /**
  * @brief 强制停止MJPEG视频流 (关闭socket, 等待最多2秒)

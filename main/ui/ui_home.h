@@ -12,5 +12,6 @@ lv_obj_t* ui_home_get_screen(void);
 void ui_home_set_wifi_status(bool connected);
 void ui_home_refresh_developer_status(void);
 void ui_home_set_camera_keepalive(bool enabled);
+void ui_home_apply_light_color(void);
 
 #endif // UI_HOME_H

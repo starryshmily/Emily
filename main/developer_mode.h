@@ -26,6 +26,12 @@ bool developer_mode_is_ws2812_test(void);
 void developer_mode_set_log_test(bool enabled);
 bool developer_mode_is_log_test(void);
 
+void developer_mode_set_stl_ply_test(bool enabled);
+bool developer_mode_is_stl_ply_test(void);
+
+void developer_mode_set_progress_bar_test(bool enabled);
+bool developer_mode_is_progress_bar_test(void);
+
 bool developer_mode_any_enabled(void);
 
 #endif // DEVELOPER_MODE_H

@@ -76,16 +76,6 @@ static void motor_test_cb(lv_event_t *e)
     }
 }
 
-static void ws2812_test_cb(lv_event_t *e)
-{
-    if (lv_event_get_code(e) == LV_EVENT_VALUE_CHANGED) {
-        bool enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
-        developer_mode_set_ws2812_test(enabled);
-        c3_uart_send(enabled ? "WS2812:ON" : "WS2812:OFF");
-        ESP_LOGI(TAG, "WS2812: %s", enabled ? "ON" : "OFF");
-    }
-}
-
 static void log_test_cb(lv_event_t *e)
 {
     if (lv_event_get_code(e) == LV_EVENT_VALUE_CHANGED) {
@@ -95,6 +85,18 @@ static void log_test_cb(lv_event_t *e)
             log_store_clear();
         }
         ESP_LOGI(TAG, "Log Record: %s", enabled ? "ON" : "OFF");
+    }
+}
+
+static void stl_ply_test_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_VALUE_CHANGED) {
+        bool enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+        developer_mode_set_stl_ply_test(enabled);
+        if (enabled) {
+            c3_uart_send("STL_PLY_TEST");
+        }
+        ESP_LOGI(TAG, "STL To PLY Test: %s", enabled ? "ON" : "OFF");
     }
 }
 
@@ -370,9 +372,9 @@ void ui_developer_create(void)
     add_switch_row(list, "Upload Test", developer_mode_is_upload_test(), upload_test_cb);
     add_switch_row(list, "History Test", developer_mode_is_history_test(), history_test_cb);
     add_switch_row(list, "UART Test", developer_mode_is_uart_test(), uart_test_cb);
-    add_switch_row(list, "Camera", developer_mode_is_camera_test(), camera_test_cb);
+    add_switch_row(list, "Bottom Camera", developer_mode_is_camera_test(), camera_test_cb);
     add_switch_row(list, "Motor", developer_mode_is_motor_test(), motor_test_cb);
-    add_switch_row(list, "WS2812", developer_mode_is_ws2812_test(), ws2812_test_cb);
+    add_switch_row(list, "STL To PLY", developer_mode_is_stl_ply_test(), stl_ply_test_cb);
     add_switch_row(list, "Log Record", developer_mode_is_log_test(), log_test_cb);
     add_action_row(list, "Log", log_row_cb);
 

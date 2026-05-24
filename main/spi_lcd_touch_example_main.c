@@ -25,6 +25,7 @@
 #include "myi2c.h"
 #include "ui_home.h"
 #include "log_store.h"
+#include "ui_camera.h"  // LCD mutex API for SPI bus protection
 // #include "gui_guider.h"
 // #include "lv_demos.h"
 
@@ -505,8 +506,12 @@ static void example_lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_
     int offsetx2 = area->x2;
     int offsety1 = area->y1;
     int offsety2 = area->y2;
+    // 获取LCD mutex，防止视频帧的SPI传输与LVGL的SPI传输交错
+    // 视频帧在video_frame_callback中也使用同一个mutex保护app_lcd_draw_bitmap
+    bool locked = ui_camera_take_lcd_mutex(100);
     // copy a buffer's content to a specific area of the display
     esp_lcd_panel_draw_bitmap(panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, color_map);
+    if (locked) ui_camera_give_lcd_mutex();
 }
 
 /* Rotate display and touch, when rotated screen in LVGL. Called when driver parameters are updated. */
@@ -710,6 +715,8 @@ void app_main(void)
     app_main_auto_connect_wifi();
 
     ESP_LOGI(TAG, "Initialize LVGL library");
+    // 在LVGL初始化前创建LCD mutex，这样flush_cb一开始就能使用
+    ui_camera_init_lcd_mutex();
     lv_init();
     // alloc draw buffers used by LVGL
     // 单缓冲40行：视频直接写LCD绕过LVGL，只需渲染UI控件

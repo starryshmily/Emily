@@ -93,6 +93,23 @@ void ui_camera_cancel_delayed_disconnect(void);
  */
 void ui_ws2812_set_mode(const char *mode);
 
+/**
+ * @brief 获取LCD绘制互斥锁 - 用于保护SPI总线访问
+ * @param timeout_ms 超时时间（毫秒）
+ * @return true if lock acquired successfully
+ */
+bool ui_camera_take_lcd_mutex(uint32_t timeout_ms);
+
+/**
+ * @brief 释放LCD绘制互斥锁
+ */
+void ui_camera_give_lcd_mutex(void);
+
+/**
+ * @brief 初始化LCD绘制互斥锁（在LVGL启动前调用）
+ */
+void ui_camera_init_lcd_mutex(void);
+
 #ifdef __cplusplus
 }
 #endif

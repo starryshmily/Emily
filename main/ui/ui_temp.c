@@ -98,6 +98,7 @@ static void btn_back_callback(lv_event_t *e)
     if(code == LV_EVENT_CLICKED) {
         ui_ws2812_set_mode("IDLE");
         lv_scr_load(ui_home_get_screen());
+        ui_home_apply_light_color();
         ui_temp_destroy();
     }
 }

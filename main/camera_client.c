@@ -213,6 +213,35 @@ static esp_err_t http_start_upload(void)
     return err;
 }
 
+static esp_err_t http_start_demo_scan(void)
+{
+    char url[128];
+    snprintf(url, sizeof(url), "http://%s:%d/api/demo_scan", g_config.host, g_config.http_port);
+
+    esp_http_client_config_t http_cfg = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 10000,
+        .buffer_size = 1024,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
+    if (!client) {
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = esp_http_client_perform(client);
+    esp_http_client_cleanup(client);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Demo scan command sent");
+    } else {
+        ESP_LOGE(TAG, "Demo scan request failed: %s", esp_err_to_name(err));
+    }
+
+    return err;
+}
+
 static esp_err_t http_start_upload_test(void)
 {
     char url[128];
@@ -687,6 +716,29 @@ esp_err_t k230_client_start_scan(void)
     return err;
 }
 
+esp_err_t k230_client_start_demo_scan(void)
+{
+    if (!g_is_connected) {
+        ESP_LOGE(TAG, "Not connected to K230");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (g_stream_running) {
+        ESP_LOGI(TAG, "Pausing stream for DEMO SCAN request");
+        g_stream_running = false;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    esp_err_t err = http_start_demo_scan();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Demo scan request failed, retrying in 300ms...");
+        vTaskDelay(pdMS_TO_TICKS(300));
+        err = http_start_demo_scan();
+    }
+
+    return err;
+}
+
 esp_err_t k230_client_start_upload(void)
 {
     if (!g_is_connected) {
@@ -727,7 +779,7 @@ esp_err_t k230_client_start_upload_test(void)
 
 esp_err_t k230_client_get_preview_image(int zone, int offset_y, uint8_t **data, size_t *len)
 {
-    if (!data || !len || zone < 0 || zone > 3) {
+    if (!data || !len || zone < 0 || zone > 4) {
         return ESP_ERR_INVALID_ARG;
     }
     *data = NULL;
@@ -895,7 +947,8 @@ esp_err_t k230_client_start_stream(void)
 void k230_client_force_stop_stream(void)
 {
     g_stream_running = false;
-    g_is_connected = false;
+    // 注意: 不清除 g_is_connected，因为这只是停止视频流，不是断开K230连接
+    // UART和HTTP仍然可用，后续可以重新start_stream
 
     // 强制关闭socket让recv立即返回错误
     if (g_stream_socket >= 0) {
@@ -913,4 +966,12 @@ void k230_client_stop_stream(void)
 {
     g_stream_running = false;
     g_is_connected = false;  // 让 recv() 立即返回
+}
+
+void k230_client_pause_stream(void)
+{
+    if (g_stream_running) {
+        g_stream_running = false;
+        ESP_LOGI(TAG, "Stream paused");
+    }
 }

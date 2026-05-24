@@ -11,8 +11,11 @@
 #include "ui_camera.h"
 #include "ui_history.h"
 #include "developer_mode.h"
+#include "settings_store.h"
+#include "c3_uart.h"
 #include "gxhtc3.h"
 #include <stdio.h>
+#include <stdint.h>
 
 // External functions from main.c
 extern void app_main_set_wifi_status_label(lv_obj_t *label);
@@ -46,6 +49,38 @@ static int32_t anim_start_h = 90;
 static lv_obj_t *wifi_status_label = NULL;
 static lv_obj_t *developer_status_label = NULL;
 static lv_obj_t *camera_keepalive_label = NULL;
+
+static void home_hue_to_rgb(uint8_t hue, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    uint8_t region = hue / 43;
+    uint8_t remainder = (hue - (region * 43)) * 6;
+    uint8_t p = 0;
+    uint8_t q = 255 - remainder;
+    uint8_t t = remainder;
+
+    switch (region) {
+    case 0: *r = 255; *g = t;   *b = p;   break;
+    case 1: *r = q;   *g = 255; *b = p;   break;
+    case 2: *r = p;   *g = 255; *b = t;   break;
+    case 3: *r = p;   *g = q;   *b = 255; break;
+    case 4: *r = t;   *g = p;   *b = 255; break;
+    default:*r = 255; *g = p;   *b = q;   break;
+    }
+}
+
+void ui_home_apply_light_color(void)
+{
+    if (!settings_store_is_ws2812_enabled()) {
+        c3_uart_send("WS2812:OFF");
+        return;
+    }
+
+    uint8_t r, g, b;
+    home_hue_to_rgb(settings_store_get_light_color(), &r, &g, &b);
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "WS2812:COLOR:%u:%u:%u", r, g, b);
+    c3_uart_send(cmd);
+}
 
 // 动画执行回调 - 改变遮罩大小和位置 (250ms优化)
 static void history_delay_timer_cb(lv_timer_t *timer)
@@ -446,6 +481,7 @@ void ui_home_create(void)
     lv_obj_add_event_cb(btn_settings, btn_settings_callback, LV_EVENT_ALL, NULL);
 
     lv_scr_load(screen_home);
+    ui_home_apply_light_color();
 }
 
 lv_obj_t* ui_home_get_screen(void)

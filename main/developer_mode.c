@@ -11,8 +11,9 @@ static bool history_test_enabled = false;
 static bool uart_test_enabled = false;
 static bool camera_test_enabled = false;
 static bool motor_test_enabled = false;
-static bool ws2812_test_enabled = false;
 static bool log_test_enabled = false;
+static bool stl_ply_test_enabled = false;
+static bool progress_bar_test_enabled = false;
 static bool developer_mode_loaded = false;
 
 static void developer_mode_save_u8(const char *key, bool enabled)
@@ -62,14 +63,16 @@ esp_err_t developer_mode_init(void)
     uart_test_enabled = developer_mode_load_u8(nvs, "uart", false);
     camera_test_enabled = developer_mode_load_u8(nvs, "camera", false);
     motor_test_enabled = developer_mode_load_u8(nvs, "motor", false);
-    ws2812_test_enabled = developer_mode_load_u8(nvs, "ws2812", false);
     log_test_enabled = developer_mode_load_u8(nvs, "log", false);
+    stl_ply_test_enabled = developer_mode_load_u8(nvs, "stl_ply", false);
+    progress_bar_test_enabled = developer_mode_load_u8(nvs, "progress", false);
     log_store_enable(log_test_enabled);
     developer_mode_loaded = true;
 
-    ESP_LOGI(TAG, "loaded: upload=%d history=%d uart=%d camera=%d motor=%d ws2812=%d log=%d",
+    ESP_LOGI(TAG, "loaded: upload=%d history=%d uart=%d camera=%d motor=%d log=%d stl_ply=%d progress=%d",
              upload_test_enabled, history_test_enabled, uart_test_enabled,
-             camera_test_enabled, motor_test_enabled, ws2812_test_enabled, log_test_enabled);
+             camera_test_enabled, motor_test_enabled, log_test_enabled,
+             stl_ply_test_enabled, progress_bar_test_enabled);
     nvs_close(nvs);
     return ESP_OK;
 }
@@ -141,15 +144,12 @@ bool developer_mode_is_motor_test(void)
 
 void developer_mode_set_ws2812_test(bool enabled)
 {
-    developer_mode_init();
-    ws2812_test_enabled = enabled;
-    developer_mode_save_u8("ws2812", enabled);
+    (void)enabled;
 }
 
 bool developer_mode_is_ws2812_test(void)
 {
-    developer_mode_init();
-    return ws2812_test_enabled;
+    return false;
 }
 
 void developer_mode_set_log_test(bool enabled)
@@ -166,9 +166,36 @@ bool developer_mode_is_log_test(void)
     return log_test_enabled;
 }
 
+void developer_mode_set_stl_ply_test(bool enabled)
+{
+    developer_mode_init();
+    stl_ply_test_enabled = enabled;
+    developer_mode_save_u8("stl_ply", enabled);
+}
+
+bool developer_mode_is_stl_ply_test(void)
+{
+    developer_mode_init();
+    return stl_ply_test_enabled;
+}
+
+void developer_mode_set_progress_bar_test(bool enabled)
+{
+    developer_mode_init();
+    progress_bar_test_enabled = enabled;
+    developer_mode_save_u8("progress", enabled);
+}
+
+bool developer_mode_is_progress_bar_test(void)
+{
+    developer_mode_init();
+    return progress_bar_test_enabled;
+}
+
 bool developer_mode_any_enabled(void)
 {
     developer_mode_init();
     return upload_test_enabled || history_test_enabled || uart_test_enabled ||
-           camera_test_enabled || motor_test_enabled || ws2812_test_enabled || log_test_enabled;
+           camera_test_enabled || motor_test_enabled || log_test_enabled ||
+           stl_ply_test_enabled || progress_bar_test_enabled;
 }

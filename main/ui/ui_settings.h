@@ -9,5 +9,6 @@
 
 void ui_settings_create(void);
 lv_obj_t* ui_settings_get_screen(void);
+void ui_settings_camera_create(void);
 
 #endif // UI_SETTINGS_H

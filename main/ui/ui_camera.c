@@ -86,7 +86,27 @@ static uint8_t video_buffer[VIDEO_W * VIDEO_H * 2];
 static SemaphoreHandle_t video_mutex = NULL;
 
 // LCD绘制互斥锁 - 防止视频帧绘制和UI更新同时进行导致SPI冲突
-static SemaphoreHandle_t lcd_draw_mutex = NULL;
+// 非static: spi_lcd_touch_example_main.c的LVGL flush_cb也需要使用
+SemaphoreHandle_t lcd_draw_mutex = NULL;
+
+// ============== 公共LCD mutex API ==============
+bool ui_camera_take_lcd_mutex(uint32_t timeout_ms)
+{
+    if (!lcd_draw_mutex) return false;
+    return xSemaphoreTakeRecursive(lcd_draw_mutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
+void ui_camera_give_lcd_mutex(void)
+{
+    if (lcd_draw_mutex) xSemaphoreGiveRecursive(lcd_draw_mutex);
+}
+
+void ui_camera_init_lcd_mutex(void)
+{
+    if (!lcd_draw_mutex) {
+        lcd_draw_mutex = xSemaphoreCreateRecursiveMutex();
+    }
+}
 
 // 首帧标志 - 必须是全局static，在create时重置
 static bool first_frame_received = false;
@@ -124,20 +144,67 @@ static volatile int preview_offset_y = 0;
 static int preview_total_h = 0;  // Total image height from JPEG header
 
 // Pre-downloaded JPEG cache for instant zone switching
-// Zone numbers: 0=Bottom, 1=Z1, 2=Z2, 3=Z3
-static uint8_t *preview_jpeg_cache[4] = {NULL};  // [0]=bottom, [1]=z1, [2]=z2, [3]=z3
-static size_t preview_jpeg_cache_len[4] = {0};
+// Zone numbers: 0=Bottom, 1=Z1, 2=Z2, 3=Z3, 4=Z4
+#define PREVIEW_CACHE_SIZE 5
+static uint8_t *preview_jpeg_cache[PREVIEW_CACHE_SIZE] = {NULL};
+static size_t preview_jpeg_cache_len[PREVIEW_CACHE_SIZE] = {0};
 static volatile bool preview_cache_ready = false;
-static bool preview_zone_available[4] = {false};  // which zones actually have photos
-static int preview_zone_list[4] = {0};            // available zone numbers (max 4: bottom+z1+z2+z3)
+static bool preview_zone_available[PREVIEW_CACHE_SIZE] = {false};  // which zones actually have photos
+static int preview_zone_list[PREVIEW_CACHE_SIZE] = {0};            // available zone numbers (max 5: bottom+z1-z4)
 static int preview_zone_count = 0;                // number of available zones
 static int preview_zone_index = 0;                // current index into preview_zone_list
 
 static TaskHandle_t preview_task_handle = NULL;
+static volatile bool preview_cancel_flag = false;  // signal preview task to stop
 static lv_timer_t *preview_show_timer = NULL;
 static int preview_displayed_zone = -1;
 static int preview_displayed_offset_y = -1;
-static float height_before_calib = 0.0f;  // 校准前的高度（用于校准模式取消）
+static float height_before_calib = 0.0f;
+
+// V1.6: Progress bar test / Demo mode (Developer Mode)
+static lv_timer_t *progress_bar_test_timer = NULL;
+static int progress_bar_test_step = 0;
+static bool progress_bar_test_active = false;
+
+// Demo mode: simulate full scan flow with real motor but no photos
+static esp_timer_handle_t demo_detect_timer = NULL;
+static esp_timer_handle_t demo_position_timer = NULL;
+static volatile bool demo_preloading = false;   // ignore UPLOAD_READY from upload_test preload
+static volatile bool demo_mode_active = false;  // demo simulation is running
+static volatile bool demo_scan_started = false;  // SCAN was clicked, accept UPLOAD_READY from demo_scan
+static char demo_scan_name[64] = {0};    // 保存K230发来的真实scan名 (如 scan_260517_143025)
+static char demo_model_path[96] = {0};   // 保存K230发来的model目录路径
+static volatile bool demo_preload_started = false;  // SCAN过程中已启动预下载
+
+typedef struct {
+    int percent;
+    const char *stage;
+} progress_bar_test_frame_t;
+
+static const progress_bar_test_frame_t progress_bar_test_frames[] = {
+    {10, "Preparing 4 imgs"},
+    {15, "Uploading"},
+    {25, "Submit Job"},
+    {35, "Waiting Model"},
+    {45, "Waiting Model"},
+    {55, "Processing"},
+    {65, "Processing"},
+    {73, "Model Ready"},
+    {76, "Download Result"},
+    {77, "Download Done"},
+    {78, "Submit PLY Task"},
+    {79, "PLY Task Queued"},
+    {83, "NAS Download STL"},
+    {88, "NAS Convert PLY"},
+    {93, "Download PLY"},
+    {98, "Download PLY"},
+    {99, "PLY Ready"},
+    {100, "Done"},
+};
+
+static void progress_bar_test_stop(void);
+static void progress_bar_test_timer_cb(lv_timer_t *timer);
+static void progress_bar_test_start(void);
 
 // K230断开检测
 static volatile int64_t last_frame_time_ms = 0; // 最后一帧时间戳
@@ -411,7 +478,7 @@ static void update_pic_zone_label(void)
 
 static void preview_free_cache(void)
 {
-    for (int i = 0; i <= 3; i++) {
+    for (int i = 0; i < PREVIEW_CACHE_SIZE; i++) {
         if (preview_jpeg_cache[i]) {
             free(preview_jpeg_cache[i]);
             preview_jpeg_cache[i] = NULL;
@@ -514,13 +581,22 @@ static void release_camera_screen_for_background(void)
 
 static void preview_cache_download_task(void *arg)
 {
-    // Delay 500ms to let K230 server settle after upload_test request
-    vTaskDelay(pdMS_TO_TICKS(500));
-    ESP_LOGI(TAG, "Pre-downloading all preview images...");
+    bool demo = developer_mode_is_progress_bar_test();
+    int delay_ms = 500;
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    ESP_LOGI(TAG, "Pre-downloading all preview images (demo=%d)...", demo);
     preview_zone_count = 0;
-    // Download order: Z1, Z2, Z3, Bottom(0)
-    static const int zone_order[] = {1, 2, 3, 0};
+    // Download order: Demo mode uses Z1-Z4 (4 zones), Normal uses Z1-Z3 + Bottom(0)
+    static const int zone_order_demo[] = {1, 2, 3, 4};
+    static const int zone_order_normal[] = {1, 2, 3, 0};
+    const int *zone_order = demo ? zone_order_demo : zone_order_normal;
     for (int i = 0; i < 4; i++) {
+        if (preview_cancel_flag) {
+            ESP_LOGI(TAG, "Preview download cancelled at zone %d", i);
+            preview_task_handle = NULL;
+            vTaskDelete(NULL);
+            return;
+        }
         int zone = zone_order[i];
         // Small delay between downloads to let previous TCP connection fully close
         if (i > 0) {
@@ -531,6 +607,7 @@ static void preview_cache_download_task(void *arg)
         // Retry up to 2 times per zone
         esp_err_t err = ESP_FAIL;
         for (int retry = 0; retry < 2 && err != ESP_OK; retry++) {
+            if (preview_cancel_flag) break;
             if (retry > 0) {
                 ESP_LOGI(TAG, "Retrying Z%d (%d/2)", zone, retry);
                 vTaskDelay(pdMS_TO_TICKS(200));
@@ -541,6 +618,13 @@ static void preview_cache_download_task(void *arg)
             ESP_LOGI(TAG, "Preview download Z%d result=%s len=%u heap=%lu",
                      zone, esp_err_to_name(err), (unsigned)jpeg_len,
                      (unsigned long)esp_get_free_heap_size());
+        }
+        if (preview_cancel_flag) {
+            if (jpeg_data) free(jpeg_data);
+            ESP_LOGI(TAG, "Preview download cancelled");
+            preview_task_handle = NULL;
+            vTaskDelete(NULL);
+            return;
         }
         if (err == ESP_OK && jpeg_data && jpeg_len > 0) {
             preview_jpeg_cache[zone] = jpeg_data;
@@ -569,7 +653,8 @@ static void preview_cache_download_task(void *arg)
     ESP_LOGI(TAG, "Available zones: %d, starting at Z%d", preview_zone_count, preview_zone);
 
     // Update zone label with actual first available zone
-    if (label_pic_zone) {
+    // Demo mode: only show zone label after SCAN starts (not during preload)
+    if (label_pic_zone && !demo) {
         if (preview_zone == 0) {
             lv_label_set_text(label_pic_zone, "Pic Btm");
         } else {
@@ -579,34 +664,12 @@ static void preview_cache_download_task(void *arg)
         }
         lv_obj_clear_flag(label_pic_zone, LV_OBJ_FLAG_HIDDEN);
     }
-    int zone = preview_zone;
-    if (preview_jpeg_cache[zone] && preview_jpeg_cache_len[zone] > 0) {
-        int img_w = 0, img_h = 0;
-        jpeg_get_dimensions(preview_jpeg_cache[zone], preview_jpeg_cache_len[zone], &img_w, &img_h);
-        ESP_LOGI(TAG, "Preview JPEG: zone=%d %dx%d", zone, img_w, img_h);
-
-        if (img_w > 0 && img_h > 0 && img_w <= 300 && img_h <= 600 &&
-            xSemaphoreTake(video_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            preview_total_h = img_h;
-            memset(video_buffer, 0, VIDEO_W * VIDEO_H * 2);
-            jpeg_decode_config_t cfg = {
-                .output_buffer = video_buffer,
-                .output_size = VIDEO_W * VIDEO_H * 2,
-                .output_width = img_w,
-                .output_height = img_h,
-                .rotate_90 = false,
-                .scale = 0,
-            };
-            if (jpeg_decode_to_rgb565(preview_jpeg_cache[zone], preview_jpeg_cache_len[zone], &cfg) == ESP_OK) {
-                if (xSemaphoreTakeRecursive(lcd_draw_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    app_lcd_draw_bitmap(VIDEO_POS_X, VIDEO_POS_Y,
-                                        VIDEO_POS_X + VIDEO_W, VIDEO_POS_Y + VIDEO_H,
-                                        video_buffer);
-                    xSemaphoreGiveRecursive(lcd_draw_mutex);
-                }
-            }
-            xSemaphoreGive(video_mutex);
-        }
+    // Always use request_preview_load() for safe display via LVGL timer
+    // Never call app_lcd_draw_bitmap directly from this background task (causes deadlock)
+    if (preview_cache_ready && preview_zone_count > 0) {
+        request_preview_load();
+    } else {
+        ESP_LOGW(TAG, "Preview cache not ready after download (%d zones)", preview_zone_count);
     }
 
     preview_task_handle = NULL;
@@ -684,6 +747,7 @@ static void request_preview_load(void)
 
     // Cache not ready yet, start download task
     if (preview_task_handle) return;
+    preview_cancel_flag = false;
     xTaskCreate(preview_cache_download_task, "preview_img", 3072, NULL, 4, &preview_task_handle);
 }
 
@@ -822,6 +886,84 @@ static void set_upload_progress_animated(int percent, const char *stage)
     lv_anim_start(&a);
 }
 
+// V1.6: Progress bar test functions
+static void progress_bar_test_stop(void)
+{
+    if (progress_bar_test_timer) {
+        lv_timer_del(progress_bar_test_timer);
+        progress_bar_test_timer = NULL;
+    }
+    progress_bar_test_active = false;
+    progress_bar_test_step = 0;
+}
+
+static void progress_bar_test_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    int frame_count = sizeof(progress_bar_test_frames) / sizeof(progress_bar_test_frames[0]);
+    if (progress_bar_test_step >= frame_count) {
+        progress_bar_test_stop();
+        request_state_change(STATE_MODEL_DONE);
+        return;
+    }
+
+    const progress_bar_test_frame_t *frame = &progress_bar_test_frames[progress_bar_test_step++];
+    set_upload_progress_animated(frame->percent, frame->stage);
+
+    if (frame->percent >= 100) {
+        progress_bar_test_stop();
+
+        // Use real scan name and model path from K230
+        const char *scan_name = demo_scan_name[0] ? demo_scan_name : "scan_unknown";
+        const char *model_path = demo_model_path[0] ? demo_model_path : "N/A";
+
+        // Parse creation time from scan name: scan_YYMMDD_HHMMSS -> 20YY-MM-DD HH:MM:SS
+        char created_time[64];
+        if (strlen(scan_name) >= 17 && strncmp(scan_name, "scan_", 5) == 0) {
+            // scan_260517_143025
+            int yy, mm, dd, hh, mi, ss;
+            if (sscanf(scan_name, "scan_%2d%2d%2d_%2d%2d%2d", &yy, &mm, &dd, &hh, &mi, &ss) == 6) {
+                snprintf(created_time, sizeof(created_time), "20%02d-%02d-%02d %02d:%02d:%02d",
+                         yy, mm, dd, hh, mi, ss);
+            } else {
+                snprintf(created_time, sizeof(created_time), "Unknown");
+            }
+        } else {
+            snprintf(created_time, sizeof(created_time), "Unknown");
+        }
+
+        // Sizes with random variation: Model ~8.6MB, Point ~10.0MB
+        int r = (int)(esp_timer_get_time() / 1000) % 10000;
+        int model_kb = 8600 + (r % 800) - 400;          // 8.2MB ~ 9.0MB
+        int point_kb = 10000 + ((r * 7) % 1000) - 500;  // 9.5MB ~ 10.5MB
+        char model_size[32], point_size[32];
+        snprintf(model_size, sizeof(model_size), "%.1fMB", model_kb / 1000.0f);
+        snprintf(point_size, sizeof(point_size), "%.1fMB", point_kb / 1000.0f);
+
+        esp_err_t err = history_store_add_full(scan_name, created_time,
+                                                model_size, point_size, model_path);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Demo history saved: %s / %s / %s / %s",
+                     scan_name, created_time, model_size, point_size);
+        } else {
+            ESP_LOGE(TAG, "Demo history save failed: %s", esp_err_to_name(err));
+        }
+        ws2812_send_mode("SUCCESS");
+        request_state_change(STATE_MODEL_DONE);
+    }
+}
+
+static void progress_bar_test_start(void)
+{
+    progress_bar_test_stop();
+    progress_bar_test_active = true;
+    progress_bar_test_step = 0;
+    ESP_LOGI(TAG, "Progress bar test V1.6 start");
+    switch_state(STATE_UPLOADING);
+    progress_bar_test_timer_cb(NULL);
+    progress_bar_test_timer = lv_timer_create(progress_bar_test_timer_cb, 1176, NULL);
+}
+
 static void handle_model_progress(const char *clean)
 {
     char payload[96];
@@ -851,6 +993,12 @@ static void handle_k230_disconnect(const char *reason)
     pending_move_direction = 0;
     pending_cancel_capture = false;
     capture_cancelled = false;
+    demo_mode_active = false;
+    demo_preloading = false;
+    demo_scan_started = false;
+    demo_preload_started = false;
+    demo_scan_name[0] = '\0';
+    demo_model_path[0] = '\0';
 
     // 同步停止camera_client的流任务，防止recv()在异常socket上操作导致pbuf崩溃
     k230_client_force_stop_stream();
@@ -871,6 +1019,15 @@ static void cleanup_camera_page_resources(void)
     preview_task_handle = NULL;
     k230_connect_task_handle = NULL;
     uart_rx_task_handle = NULL;
+
+    // Reset state machine for next session
+    current_state = STATE_CONNECTING;
+    demo_mode_active = false;
+    demo_preloading = false;
+    demo_scan_started = false;
+    demo_preload_started = false;
+    demo_scan_name[0] = '\0';
+    demo_model_path[0] = '\0';
 
     if (detect_timer) {
         esp_timer_stop(detect_timer);
@@ -946,6 +1103,13 @@ static void cleanup_camera_page_resources(void)
     has_pending_ui_update = false;
     has_pending_label = false;
     current_state = STATE_CONNECTING;
+    demo_mode_active = false;
+    demo_preloading = false;
+    demo_scan_started = false;
+    demo_preload_started = false;
+    demo_scan_name[0] = '\0';
+    demo_model_path[0] = '\0';
+    progress_bar_test_active = false;
 }
 
 static void switch_state(camera_state_t new_state)
@@ -988,6 +1152,7 @@ static void switch_state(camera_state_t new_state)
         if (label_pic_zone) lv_obj_add_flag(label_pic_zone, LV_OBJ_FLAG_HIDDEN);
         preview_free_cache();
         preview_total_h = 0;
+        show_upload_progress(false);  // Hide upload panel when returning to idle
         if (label_status) { lv_obj_clear_flag(label_status, LV_OBJ_FLAG_HIDDEN); lv_label_set_text(label_status, "Ready"); }
         lv_label_set_text(label_start, "Start");
         set_btn_style(btn_start, COLOR_GREEN, true);
@@ -1080,7 +1245,11 @@ static void switch_state(camera_state_t new_state)
         preview_mode = false;
 
         if (label_pic_zone) lv_obj_add_flag(label_pic_zone, LV_OBJ_FLAG_HIDDEN);
-        preview_free_cache();
+        // Demo mode: keep preloaded preview cache, don't clear
+        // Normal mode: clear cache for fresh scan images
+        if (!developer_mode_is_progress_bar_test() || !demo_mode_active) {
+            preview_free_cache();
+        }
         preview_total_h = 0;
         label_status ? lv_label_set_text(label_status, "Zone 1...") : (void)0;
         set_btn_disabled(btn_start, COLOR_GRAY);
@@ -1100,8 +1269,14 @@ static void switch_state(camera_state_t new_state)
         if (label_status) lv_obj_add_flag(label_status, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text(label_start, "Upload");
         set_btn_style(btn_start, COLOR_GREEN, true);
-        set_btn_disabled(btn_up, COLOR_GRAY);
-        set_btn_disabled(btn_down, COLOR_GRAY);
+        // Demo mode: allow browsing Z1-Z4 preview images
+        if (developer_mode_is_progress_bar_test() && demo_mode_active && preview_cache_ready) {
+            set_btn_style(btn_up, COLOR_ORANGE, true);
+            set_btn_style(btn_down, COLOR_ORANGE, true);
+        } else {
+            set_btn_disabled(btn_up, COLOR_GRAY);
+            set_btn_disabled(btn_down, COLOR_GRAY);
+        }
         set_btn_disabled(btn_zero, COLOR_GRAY);
         set_btn_style(btn_cancel, COLOR_RED, true);
         if (btn_calibrate) lv_obj_add_flag(btn_calibrate, LV_OBJ_FLAG_HIDDEN);
@@ -1146,11 +1321,11 @@ static void switch_state(camera_state_t new_state)
         set_upload_progress_animated(100, "Done");
         label_status ? lv_obj_clear_flag(label_status, LV_OBJ_FLAG_HIDDEN), lv_label_set_text(label_status, "Done") : (void)0;
         lv_label_set_text(label_start, "Done");
-        set_btn_disabled(btn_start, COLOR_GRAY);
+        set_btn_style(btn_start, COLOR_GREEN, true);
         set_btn_disabled(btn_up, COLOR_GRAY);
         set_btn_disabled(btn_down, COLOR_GRAY);
         set_btn_disabled(btn_zero, COLOR_GRAY);
-        set_btn_style(btn_cancel, COLOR_RED, true);
+        set_btn_disabled(btn_cancel, COLOR_GRAY);
         if (btn_calibrate) lv_obj_add_flag(btn_calibrate, LV_OBJ_FLAG_HIDDEN);
         break;
     }
@@ -1207,6 +1382,12 @@ static void process_uart_message(const char *clean)
             p++;
             slider_height_mm = atof(p);
             ESP_LOGI(TAG, "POS:OK height=%.1fmm", slider_height_mm);
+        }
+        // Demo mode: restart video stream after motor reaches position
+        if (demo_mode_active) {
+            ESP_LOGI(TAG, "Demo: POS:OK received, restarting video stream");
+            demo_preloading = false;
+            k230_client_start_stream();
         }
         if (current_state == STATE_POSITIONING || current_state == STATE_DETECTING) {
             if (detect_timer) esp_timer_stop(detect_timer);
@@ -1301,6 +1482,25 @@ static void process_uart_message(const char *clean)
         if (current_state != STATE_DETECTING) {
             request_state_change(STATE_DETECTING);
         }
+    } else if (strncmp(clean, "DEMO_SCAN_DIR|", 14) == 0) {
+        // K230通知新scan目录名，在SCAN过程中启动预下载
+        if (demo_mode_active && demo_scan_started && !demo_preload_started) {
+            const char *name = clean + 14;
+            if (name[0]) {
+                strncpy(demo_scan_name, name, sizeof(demo_scan_name) - 1);
+                demo_scan_name[sizeof(demo_scan_name) - 1] = '\0';
+                ESP_LOGI(TAG, "Demo: scan dir=%s, starting preview preload", demo_scan_name);
+                // 释放旧缓存，启动后台预下载
+                preview_free_cache();
+                preview_zone_count = 0;
+                preview_cache_ready = false;
+                preview_cancel_flag = false;
+                demo_preload_started = true;
+                if (!preview_task_handle) {
+                    xTaskCreate(preview_cache_download_task, "preview_img", 4096, NULL, 4, &preview_task_handle);
+                }
+            }
+        }
     } else if (strncmp(clean, "CAPTURE:Z", 9) == 0) {
         if (capture_cancelled) {
             ESP_LOGI(TAG, "CAPTURE:Z ignored (capture was cancelled)");
@@ -1316,7 +1516,7 @@ static void process_uart_message(const char *clean)
         } else {
             ui_camera_heartbeat();
             int zone_num = clean[9] - '0';
-            if (zone_num >= 1 && zone_num <= 3) {
+            if (zone_num >= 1 && zone_num <= 4) {
                 if (current_state != STATE_CAPTURING) {
                     request_state_change(STATE_CAPTURING);
                 }
@@ -1331,6 +1531,38 @@ static void process_uart_message(const char *clean)
             }
         }
     } else if (strncmp(clean, "UPLOAD_READY|", 13) == 0) {
+        // Demo mode: only accept UPLOAD_READY after SCAN was clicked
+        if (demo_mode_active && !demo_scan_started) {
+            ESP_LOGI(TAG, "Demo: ignoring UPLOAD_READY (pre-scan phase)");
+            demo_preloading = false;
+            return;
+        }
+        if (demo_preloading) {
+            ESP_LOGI(TAG, "Demo preload: ignoring UPLOAD_READY from upload_test");
+            demo_preloading = false;
+            return;
+        }
+        // Demo mode: save scan name and model path for history record
+        if (demo_mode_active && demo_scan_started) {
+            char payload[384];
+            snprintf(payload, sizeof(payload), "%s", clean + 13);
+            char *fields[6] = {0};
+            char *p = payload;
+            for (int i = 0; i < 6 && p; i++) {
+                fields[i] = p;
+                char *sep = strchr(p, '|');
+                if (sep) { *sep = '\0'; p = sep + 1; } else { p = NULL; }
+            }
+            if (fields[0] && fields[0][0]) {
+                strncpy(demo_scan_name, fields[0], sizeof(demo_scan_name) - 1);
+                demo_scan_name[sizeof(demo_scan_name) - 1] = '\0';
+            }
+            if (fields[5] && fields[5][0]) {
+                strncpy(demo_model_path, fields[5], sizeof(demo_model_path) - 1);
+                demo_model_path[sizeof(demo_model_path) - 1] = '\0';
+            }
+            ESP_LOGI(TAG, "Demo: saved scan info: name=%s, model_path=%s", demo_scan_name, demo_model_path);
+        }
         ui_camera_heartbeat();
         log_upload_ready_paths(clean);
         pending_cancel_capture = false;
@@ -1338,7 +1570,17 @@ static void process_uart_message(const char *clean)
         request_label_update("Upload");
         request_state_change(STATE_UPLOAD_READY);
     } else if (strncmp(clean, "UPLOAD_READY", 12) == 0) {
-        ui_camera_heartbeat();
+        // Demo mode: only accept UPLOAD_READY after SCAN was clicked
+        if (demo_mode_active && !demo_scan_started) {
+            ESP_LOGI(TAG, "Demo: ignoring UPLOAD_READY (pre-scan phase)");
+            demo_preloading = false;
+            return;
+        }
+        if (demo_preloading) {
+            ESP_LOGI(TAG, "Demo preload: ignoring UPLOAD_READY");
+            demo_preloading = false;
+            return;
+        }
         pending_cancel_capture = false;
         capture_cancelled = false;
         request_label_update("Upload");
@@ -1696,6 +1938,56 @@ static void progress_callback(int progress, const char *message, const char *sta
     }
 }
 
+// ============== Demo mode simulation timers ==============
+
+// Forward declaration (function defined later)
+static void demo_preload_task(void *arg);
+
+static void demo_position_done_cb(void *arg)
+{
+    ESP_LOGI(TAG, "Demo position timer fired: progress_test=%d demo_active=%d state=%d",
+             developer_mode_is_progress_bar_test(), demo_mode_active, current_state);
+    if (!developer_mode_is_progress_bar_test() || !demo_mode_active) {
+        ESP_LOGW(TAG, "Demo position: skipped (conditions not met)");
+        return;
+    }
+    if (current_state == STATE_POSITIONING) {
+        ESP_LOGI(TAG, "Demo: sending MOVE_TO_HEIGHT:126 to K230, then starting preload");
+        c3_uart_send("MOVE_TO_HEIGHT:126");
+        // K230 will move motor and respond with POS:OK:<height>
+        // ESP32's process_uart_message handles POS:OK → POS_SUCCESS
+        // Meanwhile, start upload_test in background (precompress during motor movement)
+        TaskHandle_t preload_task = NULL;
+        xTaskCreate(demo_preload_task, "demo_preload", 4096, NULL, 5, &preload_task);
+        if (preload_task) {
+            ESP_LOGI(TAG, "Demo: preload task created (runs during motor movement)");
+        } else {
+            ESP_LOGE(TAG, "Demo: failed to create preload task!");
+        }
+    } else {
+        ESP_LOGW(TAG, "Demo position: wrong state=%d (expected POSITIONING=%d)", current_state, STATE_POSITIONING);
+    }
+}
+
+static void demo_detect_done_cb(void *arg)
+{
+    ESP_LOGI(TAG, "Demo detect timer fired: progress_test=%d demo_active=%d state=%d",
+             developer_mode_is_progress_bar_test(), demo_mode_active, current_state);
+    if (!developer_mode_is_progress_bar_test() || !demo_mode_active) return;
+    if (current_state == STATE_DETECTING) {
+        ESP_LOGI(TAG, "Demo: detect done, starting positioning");
+        request_state_change(STATE_POSITIONING);
+        if (demo_position_timer) {
+            esp_timer_start_once(demo_position_timer, 2000000);  // 2s
+            ESP_LOGI(TAG, "Demo: position timer started (2s)");
+        } else {
+            ESP_LOGE(TAG, "Demo: position timer is NULL!");
+        }
+    } else {
+        ESP_LOGW(TAG, "Demo detect: wrong state=%d (expected DETECTING=%d)", current_state, STATE_DETECTING);
+    }
+}
+
 // ============== Button callbacks ==============
 
 static void btn_back_callback(lv_event_t *e)
@@ -1780,30 +2072,121 @@ static void upload_start_task(void *arg)
     vTaskDelete(NULL);
 }
 
+// Demo mode: background task to prepare K230 after sending MOVE_TO_HEIGHT
+// Runs upload_test (precompress images during motor movement) + preview download
+// After POS:OK, stream is restarted
+static void demo_preload_task(void *arg)
+{
+    ESP_LOGI(TAG, "Demo preload: motor moving, starting upload_test...");
+    k230_client_start_upload_test();
+    ESP_LOGI(TAG, "Demo preload: upload_test done, starting image download...");
+    preview_free_cache();
+    preview_zone_count = 0;
+    preview_cache_ready = false;
+    preview_cancel_flag = false;  // reset cancel flag before starting download
+    if (!preview_task_handle) {
+        xTaskCreate(preview_cache_download_task, "preview_img", 4096, NULL, 4, &preview_task_handle);
+    }
+    ESP_LOGI(TAG, "Demo preload: ready, waiting for POS:OK to restart stream");
+    // Stream restart happens when POS:OK arrives (see POS:OK handler)
+    vTaskDelete(NULL);
+}
+
 static void btn_start_callback(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
     if (current_state == STATE_IDLE) {
-        ESP_LOGI(TAG, "Start: sending START_DETECT to K230");
-        c3_uart_send(CMD_START_DETECT);
-        switch_state(STATE_DETECTING);
-    } else if (current_state == STATE_POS_SUCCESS || current_state == STATE_LIMIT_FAILED) {
-        ESP_LOGI(TAG, "Scan: sending START_SCAN to K230");
-        ws2812_send_mode("SCAN");
-        if (developer_mode_is_motor_test()) {
-            ESP_LOGI(TAG, "Scan: auto turning Motor Test OFF");
-            developer_mode_set_motor_test(false);
-            c3_uart_send("MOTOR_TEST:OFF");
+        if (developer_mode_is_progress_bar_test()) {
+            // Demo mode: DETECTING → POSITIONING → MOVE_TO_HEIGHT:126 → POS_SUCCESS
+            // Same as real flow: stream pauses, motor moves, then prepare images
+            ESP_LOGI(TAG, "Demo START: pausing stream, starting simulation");
+            demo_mode_active = true;
+            demo_preloading = true;
+            switch_state(STATE_DETECTING);
+            // Pause stream immediately (like real YOLO mode does)
+            k230_client_pause_stream();
+            // Clear preview cache
+            preview_free_cache();
+            preview_zone_count = 0;
+            preview_cache_ready = false;
+            // Start simulation timers
+            // t=2s: DETECT→POSITIONING, t=4s: MOVE_TO_HEIGHT:126 (motor moves)
+            if (demo_detect_timer) {
+                esp_timer_start_once(demo_detect_timer, 2000000);
+            }
+        } else {
+            ESP_LOGI(TAG, "Start: sending START_DETECT to K230");
+            c3_uart_send(CMD_START_DETECT);
+            switch_state(STATE_DETECTING);
         }
-        capture_cancelled = false;  // 重置取消标志，开始新的扫描
-        pending_cancel_capture = false;
-        k230_client_start_scan();
+    } else if (current_state == STATE_POS_SUCCESS || current_state == STATE_LIMIT_FAILED) {
+        if (developer_mode_is_progress_bar_test()) {
+            // Demo mode: call K230 demo_scan (real motor movement, no photos)
+            ESP_LOGI(TAG, "Demo SCAN: calling demo_scan (real motor, no photos)");
+            demo_scan_started = true;  // Allow UPLOAD_READY from demo_scan
+            // Signal preview download task to stop (don't vTaskDelete - causes socket leak/crash)
+            if (preview_task_handle) {
+                ESP_LOGI(TAG, "Demo SCAN: signaling preview download to stop");
+                preview_cancel_flag = true;
+            }
+            // Force stop stream to cleanly close TCP connection before POST
+            k230_client_force_stop_stream();
+            vTaskDelay(pdMS_TO_TICKS(300));
+            ws2812_send_mode("SCAN");
+            capture_cancelled = false;
+            pending_cancel_capture = false;
+            esp_err_t err = k230_client_start_demo_scan();
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Demo scan failed: %s", esp_err_to_name(err));
+            }
+        } else {
+            ESP_LOGI(TAG, "Scan: sending START_SCAN to K230");
+            ws2812_send_mode("SCAN");
+            if (developer_mode_is_motor_test()) {
+                ESP_LOGI(TAG, "Scan: auto turning Motor Test OFF");
+                developer_mode_set_motor_test(false);
+                c3_uart_send("MOTOR_TEST:OFF");
+            }
+            capture_cancelled = false;
+            pending_cancel_capture = false;
+            k230_client_start_scan();
+        }
     } else if (current_state == STATE_UPLOAD_READY || current_state == STATE_UPLOAD_FAILED) {
-        ESP_LOGI(TAG, "Upload: sending UPLOAD to K230");
-        ws2812_send_mode("UPLOAD");
-        switch_state(STATE_UPLOADING);
-        xTaskCreate(upload_start_task, "upload", 4096, NULL, 4, NULL);
+        if (developer_mode_is_progress_bar_test()) {
+            // Demo mode: play progress animation instead of real upload
+            ESP_LOGI(TAG, "Demo UPLOAD: starting progress animation");
+            ws2812_send_mode("UPLOAD");
+            upload_cancelled = false;
+            progress_bar_test_start();
+        } else {
+            ESP_LOGI(TAG, "Upload: sending UPLOAD to K230");
+            ws2812_send_mode("UPLOAD");
+            switch_state(STATE_UPLOADING);
+            xTaskCreate(upload_start_task, "upload", 4096, NULL, 4, NULL);
+        }
+    } else if (current_state == STATE_MODEL_DONE) {
+        // Done button: return to IDLE, HOME slider, resume video
+        ESP_LOGI(TAG, "Done: returning to IDLE");
+        if (progress_bar_test_active) {
+            progress_bar_test_stop();
+        }
+        preview_free_cache();
+        demo_mode_active = false;
+        demo_preloading = false;
+        demo_scan_started = false;
+        demo_scan_name[0] = '\0';
+        demo_model_path[0] = '\0';
+        // Send HOME to reset slider to zero position
+        if (slider_height_mm > 1.0f) {
+            slider_moving = true;
+            pending_move_direction = -1;
+            if (slider_move_timer) esp_timer_start_once(slider_move_timer, 25000000);
+            c3_uart_send("HOME");
+        }
+        ws2812_send_mode("IDLE");
+        switch_state(STATE_IDLE);
+        k230_client_start_stream();  // Resume video after demo flow ends
     } else if (current_state == STATE_CONN_FAILED) {
         ESP_LOGI(TAG, "Reconnect: restarting connection to K230");
         ws2812_send_mode("CONNECTING");
@@ -1824,6 +2207,14 @@ static void btn_cancel_callback(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
+    // V1.6: Progress bar test cancel
+    if (progress_bar_test_active) {
+        ESP_LOGI(TAG, "Cancel progress bar test");
+        progress_bar_test_stop();
+        switch_state(STATE_IDLE);
+        return;
+    }
+
     if (current_state == STATE_CALIBRATING) {
         // 校准模式: 取消校准，恢复校准前高度，返回IDLE（不保存修改）
         ESP_LOGI(TAG, "Cancel calibration: restore height=%.1fmm", height_before_calib);
@@ -1832,14 +2223,23 @@ static void btn_cancel_callback(lv_event_t *e)
         pending_move_direction = 0;
         switch_state(STATE_IDLE);
     } else if (current_state == STATE_DETECTING || current_state == STATE_POSITIONING) {
-        // K230还在YOLO模式，发送STOP让它退出并清理，同时立即切回IDLE
-        ESP_LOGI(TAG, "Cancel: sending STOP to K230 and switching to IDLE");
-        c3_uart_send(CMD_STOP);
-        // 立即恢复IDLE状态，不等待K230响应
-        switch_state(STATE_IDLE);
-        // 启动强制停止定时器 (5秒后如果K230没响应则确保状态正确)
-        if (force_stop_timer) {
-            esp_timer_start_once(force_stop_timer, 5000000);
+        // Demo mode: just return to IDLE without sending STOP (since no START_DETECT was sent)
+        if (developer_mode_is_progress_bar_test() && demo_mode_active) {
+            ESP_LOGI(TAG, "Demo cancel: returning to IDLE (no STOP needed)");
+            demo_mode_active = false;
+            demo_preloading = false;
+            demo_scan_started = false;
+            demo_scan_name[0] = '\0';
+            demo_model_path[0] = '\0';
+            switch_state(STATE_IDLE);
+        } else {
+            // K230还在YOLO模式，发送STOP让它退出并清理，同时立即切回IDLE
+            ESP_LOGI(TAG, "Cancel: sending STOP to K230 and switching to IDLE");
+            c3_uart_send(CMD_STOP);
+            switch_state(STATE_IDLE);
+            if (force_stop_timer) {
+                esp_timer_start_once(force_stop_timer, 5000000);
+            }
         }
     } else if (current_state == STATE_POS_SUCCESS || current_state == STATE_LIMIT_FAILED ||
                current_state == STATE_POS_FAILED) {
@@ -1855,8 +2255,17 @@ static void btn_cancel_callback(lv_event_t *e)
                current_state == STATE_UPLOAD_FAILED || current_state == STATE_MODEL_DONE) {
         // Cancel upload/model flow: return to idle lighting and controls
         upload_cancelled = true;
+        if (progress_bar_test_active) {
+            progress_bar_test_stop();
+        }
         preview_free_cache();
+        demo_mode_active = false;
+        demo_scan_started = false;
+        demo_preload_started = false;
+        demo_scan_name[0] = '\0';
+        demo_model_path[0] = '\0';
         switch_state(STATE_IDLE);
+        k230_client_start_stream();  // Cancel后恢复视频流
     } else if (current_state == STATE_CAPTURING) {
         // 拍摄中取消: 不立即发STOP，等当前移动完成(HEIGHT消息)后再发
         // 避免电机中途停下导致高度未刷新，归零不准
@@ -2128,6 +2537,24 @@ void ui_camera_create(void)
     };
     esp_timer_create(&move_timer_args, &slider_move_timer);
 
+    // 创建Demo模式模拟定时器
+    if (!demo_detect_timer) {
+        esp_timer_create_args_t dt_args = {
+            .callback = demo_detect_done_cb,
+            .name = "demo_detect",
+            .dispatch_method = ESP_TIMER_TASK,
+        };
+        esp_timer_create(&dt_args, &demo_detect_timer);
+    }
+    if (!demo_position_timer) {
+        esp_timer_create_args_t dp_args = {
+            .callback = demo_position_done_cb,
+            .name = "demo_position",
+            .dispatch_method = ESP_TIMER_TASK,
+        };
+        esp_timer_create(&dp_args, &demo_position_timer);
+    }
+
     // 创建LVGL timer用于线程安全延迟执行UI操作 (50ms检查一次)
     deferred_timer = lv_timer_create(deferred_timer_cb, 50, NULL);
 
@@ -2346,6 +2773,12 @@ void ui_camera_create(void)
 
     update_height_label();
     lv_scr_load(screen_camera);
+
+    // Demo mode (progress bar test): connect to K230 normally,
+    // simulation starts when user clicks START (see btn_start_callback)
+    if (developer_mode_is_progress_bar_test()) {
+        ESP_LOGI(TAG, "Demo mode active: normal K230 connection, simulation on START");
+    }
 
     if (resume_from_background && k230_connected) {
         first_frame_received = true;

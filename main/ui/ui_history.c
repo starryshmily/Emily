@@ -82,6 +82,7 @@ static void back_callback(lv_event_t *e)
 {
     if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
         lv_scr_load(ui_home_get_screen());
+        ui_home_apply_light_color();
         ui_history_destroy();
     }
 }

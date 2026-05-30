@@ -16,6 +16,7 @@
 #include "c3_uart.h"
 #include "history_store.h"
 #include "developer_mode.h"
+#include "settings_store.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_timer.h"
@@ -586,10 +587,11 @@ static void preview_cache_download_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(delay_ms));
     ESP_LOGI(TAG, "Pre-downloading all preview images (demo=%d)...", demo);
     preview_zone_count = 0;
-    // Download order: Demo mode uses Z1-Z4 (4 zones), Normal uses Z1-Z3 + Bottom(0)
-    static const int zone_order_demo[] = {1, 2, 3, 4};
-    static const int zone_order_normal[] = {1, 2, 3, 0};
-    const int *zone_order = demo ? zone_order_demo : zone_order_normal;
+    // Download order: 4-zone (BOTTOM OFF) uses Z1-Z4, 3-zone (BOTTOM ON) uses Z1-Z3 + Bottom(0)
+    static const int zone_order_4zone[] = {1, 2, 3, 4};
+    static const int zone_order_3zone[] = {1, 2, 3, 0};
+    bool use_4zone = demo || !settings_store_is_bottom_cam_enabled();
+    const int *zone_order = use_4zone ? zone_order_4zone : zone_order_3zone;
     for (int i = 0; i < 4; i++) {
         if (preview_cancel_flag) {
             ESP_LOGI(TAG, "Preview download cancelled at zone %d", i);
@@ -1291,7 +1293,10 @@ static void switch_state(camera_state_t new_state)
         upload_cancelled = false;  // Fresh upload, reset cancel flag
         // Keep preview cache alive for cancel-back-to-UPLOAD_READY
         preview_total_h = 0;
-        set_upload_progress_animated(5, "Preparing");
+        // Only show initial "5% Preparing" on first entry, not on re-entry from MODEL_PROGRESS
+        if (old_state != STATE_UPLOADING) {
+            set_upload_progress_animated(5, "Preparing");
+        }
         label_status ? lv_obj_clear_flag(label_status, LV_OBJ_FLAG_HIDDEN), lv_label_set_text(label_status, "Upload") : (void)0;
         lv_label_set_text(label_start, "Wait");
         set_btn_disabled(btn_start, COLOR_GRAY);
@@ -1824,6 +1829,9 @@ static void k230_connect_task(void *arg)
 
     // 向K230查询当前高度
     c3_uart_send("GET_HEIGHT");
+
+    // 同步拍摄模式: BOTTOM开关ON=3区域+底部, OFF=4区域
+    c3_uart_send(settings_store_is_bottom_cam_enabled() ? "CAMERA_MODE:3" : "CAMERA_MODE:4");
 
     // 不立即切IDLE, 等首帧到达后在video_frame_callback中切换
 

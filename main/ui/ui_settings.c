@@ -91,6 +91,9 @@ static void bottom_cam_switch_callback(lv_event_t *e)
     if (lv_event_get_code(e) == LV_EVENT_VALUE_CHANGED) {
         bool enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
         settings_store_set_bottom_cam_enabled(enabled);
+        c3_uart_send(enabled ? "CAMERA_MODE:3" : "CAMERA_MODE:4");
+        ESP_LOGI(TAG, "BOTTOM cam: %s → %s", enabled ? "ON" : "OFF",
+                 enabled ? "3-zone+bottom" : "4-zone");
     }
 }
 

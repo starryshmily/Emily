@@ -236,7 +236,18 @@ static esp_err_t http_start_demo_scan(void)
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "Demo scan command sent");
     } else {
-        ESP_LOGE(TAG, "Demo scan request failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "Demo scan first attempt failed: %s, retrying in 500ms...", esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(500));
+        client = esp_http_client_init(&http_cfg);
+        if (client) {
+            err = esp_http_client_perform(client);
+            esp_http_client_cleanup(client);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "Demo scan retry succeeded");
+            } else {
+                ESP_LOGE(TAG, "Demo scan retry also failed: %s", esp_err_to_name(err));
+            }
+        }
     }
 
     return err;
@@ -317,6 +328,15 @@ static void mjpeg_stream_task(void *arg)
         close(sock);
         g_stream_socket = -1;
         g_stream_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // 连接前检查：如果force_stop_stream已被调用，直接退出（防止和SCAN的HTTP POST冲突）
+    if (!g_stream_running) {
+        ESP_LOGI(TAG, "Stream cancelled before connect, exiting");
+        close(sock);
+        g_stream_socket = -1;
         vTaskDelete(NULL);
         return;
     }
